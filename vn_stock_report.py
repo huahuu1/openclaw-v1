@@ -6,10 +6,11 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path('/Users/huuht/.openclaw/workspace')
+ROOT = Path(__file__).resolve().parent
 SCAN = ROOT / 'vn_stock_scan.py'
 NEWS = ROOT / 'vn_stock_news.py'
 HISTORY_DIR = ROOT / 'memory' / 'vn_stock_reports'
+DEFAULT_PORTFOLIO_FILE = ROOT / 'memory' / 'vn_portfolio.json'
 
 BAN_DO_NHAN = {
     'PROPOSE': 'Đề cử',
@@ -32,6 +33,13 @@ BAN_DO_NHAN = {
     'technology': 'Công nghệ',
     'chemicals': 'Hóa chất',
     'other': 'Khác',
+    'risk_on': 'Thuận lợi',
+    'mixed': 'Phân hóa',
+    'risk_off': 'Phòng thủ',
+    'fresh': 'Mới',
+    'recent': 'Gần đây',
+    'stale': 'Cũ',
+    'delayed': 'Trễ dữ liệu',
 }
 
 BAN_DO_LY_DO = {
@@ -41,10 +49,19 @@ BAN_DO_LY_DO = {
     'm15_trigger_ok': 'Khung 15 phút cho tín hiệu',
     'extended_do_not_chase': 'Đã tăng nóng, không nên mua đuổi',
     'news_risk': 'Tin tức có rủi ro',
+    'market_risk_off': 'Bối cảnh thị trường chưa thuận lợi',
+    'portfolio_position_exists': 'Đã có sẵn trong danh mục',
 }
 
-
-TIMEOUT = 15
+TIMEOUT = 20
+MODE_CONFIG = {
+    'balanced': {'label': 'Cân bằng', 'risk_buffer': 1.0, 'chase_tolerance': 1.0, 'max_position_factor': 1.0},
+    'scalp': {'label': 'Scalp/T+ nhanh', 'risk_buffer': 0.85, 'chase_tolerance': 0.8, 'max_position_factor': 0.8},
+    'swing': {'label': 'Swing ngắn', 'risk_buffer': 1.0, 'chase_tolerance': 1.0, 'max_position_factor': 1.0},
+    'trend': {'label': 'Giữ theo xu hướng', 'risk_buffer': 1.2, 'chase_tolerance': 1.15, 'max_position_factor': 1.1},
+    'defensive': {'label': 'Phòng thủ', 'risk_buffer': 0.8, 'chase_tolerance': 0.75, 'max_position_factor': 0.7},
+    'aggressive': {'label': 'Chủ động/rủi ro cao', 'risk_buffer': 1.15, 'chase_tolerance': 1.2, 'max_position_factor': 1.15},
+}
 
 
 def run_json(cmd):
@@ -56,6 +73,35 @@ def http_get_json(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://cafef.vn/'})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return json.loads(r.read().decode('utf-8', errors='ignore'))
+
+
+def load_portfolio(path):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+    positions = data.get('positions', data if isinstance(data, dict) else {})
+    out = {}
+    if isinstance(positions, dict):
+        iterator = positions.items()
+    else:
+        iterator = []
+        for item in positions or []:
+            if isinstance(item, dict) and item.get('symbol'):
+                iterator.append((item['symbol'], item))
+    for symbol, item in iterator:
+        if not isinstance(item, dict):
+            continue
+        out[str(symbol).upper()] = {
+            'quantity': item.get('quantity') or item.get('qty') or 0,
+            'avg_price': item.get('avg_price') or item.get('price') or item.get('cost') or 0,
+            'note': item.get('note'),
+            't_plus': item.get('t_plus'),
+        }
+    return out
 
 
 def lam_tron_ty(vnd):
@@ -100,6 +146,7 @@ def lay_dong_tien_ma(symbol, so_phien=5):
     dong_tien = {
         'khối_ngoại': None,
         'tự_doanh': None,
+        'canh_bao': [],
     }
 
     try:
@@ -118,8 +165,10 @@ def lay_dong_tien_ma(symbol, so_phien=5):
             )
             dong_tien['khối_ngoại']['ngày'] = moi_nhat.get('Ngay')
             dong_tien['khối_ngoại']['sở_hữu_pct'] = moi_nhat.get('DangSoHuu')
+        else:
+            dong_tien['canh_bao'].append('không có dữ liệu khối ngoại mới')
     except Exception:
-        pass
+        dong_tien['canh_bao'].append('lỗi lấy dữ liệu khối ngoại')
 
     try:
         tu_doanh = http_get_json(tu_doanh_url)
@@ -141,8 +190,10 @@ def lay_dong_tien_ma(symbol, so_phien=5):
                 (gt_mua or 0) - (gt_ban or 0),
             )
             dong_tien['tự_doanh']['ngày'] = moi_nhat.get('Date')
+        else:
+            dong_tien['canh_bao'].append('không có dữ liệu tự doanh mới')
     except Exception:
-        pass
+        dong_tien['canh_bao'].append('lỗi lấy dữ liệu tự doanh')
 
     return dong_tien
 
@@ -202,18 +253,33 @@ def tinh_quan_tri_von(tai_khoan, rui_ro_phan_tram, gia_vao, moc_sai, ti_le_toi_d
     }
 
 
-def xay_dung_ke_hoach(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_vao_lenh=0.2, cho_phep_vuot=False, he_so_vuot_mac_dinh=1.0):
+def xep_hang_hanh_dong(final_label, market_regime, row, mode):
+    if final_label == 'PROPOSE' and market_regime == 'risk_on':
+        return 3
+    if final_label in ('PROPOSE', 'PROMOTE_TO_WATCHPLUS'):
+        return 2
+    if final_label == 'WATCH':
+        return 1
+    if final_label == 'CAUTION':
+        return 0
+    return -1
+
+
+def xay_dung_ke_hoach(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_vao_lenh=0.2, cho_phep_vuot=False, he_so_vuot_mac_dinh=1.0, market_context=None, mode='balanced', position=None):
     close = row['close']
     stop_ref = row.get('stop_ref') or close
     atr = row.get('atr14') or 0
     high20 = row.get('high20') or close
     ema20 = row.get('ema20') or close
     risk_pct = row.get('risk_pct_to_stop') or 999
+    mode_cfg = MODE_CONFIG.get(mode, MODE_CONFIG['balanced'])
+    market_context = market_context or {}
+    market_regime = market_context.get('regime', 'mixed')
 
     diem_mua_vung_chinh = round(max(ema20, close - atr * 0.5), 2)
     diem_mua_vuot_dinh = round(high20 * 1.005, 2)
-    khong_mua_duoi_tren = round(close + atr * 0.8, 2) if atr else round(close * 1.02, 2)
-    moc_sai = round(stop_ref, 2)
+    khong_mua_duoi_tren = round(close + atr * 0.8 * mode_cfg['chase_tolerance'], 2) if atr else round(close * 1.02, 2)
+    moc_sai = round(stop_ref * mode_cfg['risk_buffer'], 2) if stop_ref < close else round(stop_ref, 2)
     rui_ro_gia = max(0.01, diem_mua_vung_chinh - moc_sai)
     dung_lo_chat = round(max(moc_sai, diem_mua_vung_chinh - atr * 0.6), 2) if atr else moc_sai
     dung_lo_chuan = moc_sai
@@ -235,6 +301,12 @@ def xay_dung_ke_hoach(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_va
         hanh_dong = 'Chưa nên mở vị thế mới'
         vung_mua = 'Chưa có vùng mua phù hợp'
 
+    if market_regime == 'risk_off' and row.get('final_label') in ('PROPOSE', 'WATCH', 'PROMOTE_TO_WATCHPLUS'):
+        hanh_dong = 'Thị trường chưa thuận lợi, chỉ nên thăm dò rất nhỏ hoặc chờ thêm xác nhận'
+
+    if position and (position.get('quantity') or 0) > 0:
+        hanh_dong = 'Đã có vị thế: ưu tiên quản trị lệnh hiện tại trước khi nghĩ tới mua mới'
+
     if row.get('final_label') == 'PROPOSE' and risk_pct <= 3.5 and row.get('news_verdict') != 'negative':
         do_uu_tien = 'A'
     elif row.get('final_label') in ('PROMOTE_TO_WATCHPLUS', 'WATCH', 'PROPOSE'):
@@ -255,9 +327,14 @@ def xay_dung_ke_hoach(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_va
         ly_do.append('extended_do_not_chase')
     if row.get('news_verdict') == 'negative':
         ly_do.append('news_risk')
+    if market_regime == 'risk_off':
+        ly_do.append('market_risk_off')
+    if position and (position.get('quantity') or 0) > 0:
+        ly_do.append('portfolio_position_exists')
 
     la_ma_dan_song = row.get('final_label') == 'PROMOTE_TO_WATCHPLUS' and row.get('news_verdict') == 'positive' and 'avoid_chasing' in row.get('notes', [])
     he_so_vuot = he_so_vuot_mac_dinh if (cho_phep_vuot and la_ma_dan_song) else 1.0
+    he_so_vuot *= mode_cfg['max_position_factor']
     quan_tri_von = tinh_quan_tri_von(tai_khoan, rui_ro_phan_tram, diem_mua_vung_chinh, moc_sai, ti_le_toi_da_vao_lenh, he_so_vuot)
 
     return {
@@ -277,16 +354,45 @@ def xay_dung_ke_hoach(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_va
         'ly_do': [BAN_DO_LY_DO.get(x, x) for x in ly_do],
         'quan_tri_von': quan_tri_von,
         'duoc_ap_dung_rule_vuot': bool(he_so_vuot > 1.0),
+        'che_do_giao_dich': MODE_CONFIG.get(mode, MODE_CONFIG['balanced'])['label'],
+        'xep_hang_hanh_dong': xep_hang_hanh_dong(row.get('final_label'), market_regime, row, mode),
     }
 
 
-def viet_hoa_mot_dong(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_vao_lenh=0.2, cho_phep_vuot=False, he_so_vuot_mac_dinh=1.0):
+def build_portfolio_context(symbol, position, close):
+    if not position or not position.get('quantity'):
+        return None
+    avg_price = position.get('avg_price') or 0
+    pnl_per_share = round(close - avg_price, 2)
+    pnl_total = round(pnl_per_share * (position.get('quantity') or 0), 2)
+    pnl_pct = round(((close - avg_price) / avg_price * 100), 2) if avg_price else None
+    return {
+        'ma': symbol,
+        'so_luong': position.get('quantity'),
+        'gia_von': avg_price,
+        'lai_lo_tam_tinh_moi_co': pnl_per_share,
+        'lai_lo_tam_tinh_tong': pnl_total,
+        'lai_lo_tam_tinh_pct': pnl_pct,
+        'ghi_chu': position.get('note'),
+        't_plus': position.get('t_plus'),
+    }
+
+
+def viet_hoa_mot_dong(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_vao_lenh=0.2, cho_phep_vuot=False, he_so_vuot_mac_dinh=1.0, market_context=None, mode='balanced', portfolio_map=None):
     dong_tien = lay_dong_tien_ma(row['symbol'])
     nguon_tin_tham_khao = lam_dep_nguon_tin(row.get('news_source_links', []))
+    position = (portfolio_map or {}).get(row['symbol'])
+    portfolio_context = build_portfolio_context(row['symbol'], position, row['close'])
+    data_timestamps = row.get('data_timestamps', {})
+    freshness = row.get('freshness', {})
+    data_quality_warnings = list(row.get('data_quality_warnings', []))
+    if dong_tien.get('canh_bao'):
+        data_quality_warnings.extend(dong_tien.get('canh_bao'))
     return {
         'ma': row['symbol'],
         'nhom_nganh': BAN_DO_NHAN.get(row.get('sector'), row.get('sector')),
         'gia_dong_cua': row['close'],
+        'gia_intraday_hien_tai': row['close'],
         'phan_tram_1_phien': row.get('change_pct_1d'),
         'phan_tram_5_phien': row.get('change_pct_5d'),
         'phan_tram_20_phien': row.get('change_pct_20d'),
@@ -304,6 +410,7 @@ def viet_hoa_mot_dong(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_va
         'danh_gia_tin_tuc': BAN_DO_NHAN.get(row.get('news_verdict'), row.get('news_verdict')),
         'tong_diem': row.get('final_score'),
         'xep_loai': BAN_DO_NHAN.get(row.get('final_label'), row.get('final_label')),
+        'diem_thanh_phan': row.get('score_components'),
         'tin_noi_bat': row.get('top_news', []),
         'tom_tat_tin': row.get('news_summary_items', []),
         'nguon_tin_tham_khao': nguon_tin_tham_khao,
@@ -313,11 +420,24 @@ def viet_hoa_mot_dong(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_va
         'ket_luan_xu_the_tin': row.get('news_trend_view'),
         'do_tin_cay_xu_the_tin': row.get('news_trend_confidence'),
         'dong_tien': dong_tien,
-        **xay_dung_ke_hoach(row, tai_khoan, rui_ro_phan_tram, ti_le_toi_da_vao_lenh, cho_phep_vuot, he_so_vuot_mac_dinh),
+        'du_lieu_thoi_gian': {
+            'daily_iso': data_timestamps.get('daily_iso'),
+            'h1_iso': data_timestamps.get('h1_iso'),
+            'm15_iso': data_timestamps.get('m15_iso'),
+            'daily_status': freshness.get('daily_status'),
+            'h1_status': freshness.get('h1_status'),
+            'm15_status': freshness.get('m15_status'),
+            'daily_age_minutes': freshness.get('daily_age_minutes'),
+            'h1_age_minutes': freshness.get('h1_age_minutes'),
+            'm15_age_minutes': freshness.get('m15_age_minutes'),
+        },
+        'canh_bao_du_lieu': data_quality_warnings,
+        'danh_muc_hien_tai': portfolio_context,
+        **xay_dung_ke_hoach(row, tai_khoan, rui_ro_phan_tram, ti_le_toi_da_vao_lenh, cho_phep_vuot, he_so_vuot_mac_dinh, market_context, mode, position),
     }
 
 
-def tron_du_lieu(scan_payload, news_payload):
+def tron_du_lieu(scan_payload, news_payload, mode='balanced'):
     news_map = {x['symbol']: x for x in news_payload['results']}
 
     breadth_extended = scan_payload.get('breadth_extended', {}) or {}
@@ -328,6 +448,7 @@ def tron_du_lieu(scan_payload, news_payload):
         for x in sector_strength
         if (x.get('count', 0) >= 2 and (x.get('above_ema20_ratio') or 0) >= 0.5)
     }
+    market_context = scan_payload.get('market_context', {}) or {}
 
     rows = []
     for item in scan_payload['all']:
@@ -352,6 +473,11 @@ def tron_du_lieu(scan_payload, news_payload):
         if bien_dong_nganh > 0:
             diem_nganh_dan_song += 1
 
+        if market_context.get('regime') == 'risk_off':
+            final_score -= 1
+        elif market_context.get('regime') == 'risk_on':
+            final_score += 1
+
         final_score += diem_nganh_dan_song
         label = item['verdict']
         if item['verdict'] == 'WATCH' and n['verdict'] == 'positive' and final_score >= 9:
@@ -360,6 +486,8 @@ def tron_du_lieu(scan_payload, news_payload):
             label = 'CAUTION'
         if item['verdict'] == 'WATCH' and la_nhom_dan_song and item.get('h1_trend_ok') and item.get('change_pct_1d', 0) > 0:
             label = 'PROMOTE_TO_WATCHPLUS'
+        if market_context.get('regime') == 'risk_off' and label == 'PROPOSE':
+            label = 'WATCH'
 
         merged = {
             **item,
@@ -386,6 +514,13 @@ def tron_du_lieu(scan_payload, news_payload):
             'la_nhom_dan_song': la_nhom_dan_song,
             'final_score': final_score,
             'final_label': label,
+            'score_components': {
+                **(item.get('score_breakdown') or {}),
+                'news_score_clamped': clamp_news_score(n['news_score']),
+                'sector_leadership_score': diem_nganh_dan_song,
+                'market_context_score': 1 if market_context.get('regime') == 'risk_on' else -1 if market_context.get('regime') == 'risk_off' else 0,
+                'final_score': final_score,
+            },
         }
         rows.append(merged)
     rows.sort(
@@ -410,17 +545,21 @@ def luu_lich_su(payload_viet):
     return str(path)
 
 
-def doc_lich_su_hom_truoc():
+def doc_lich_su_hom_truoc(bo_qua_path=None):
     if not HISTORY_DIR.exists():
         return None
     files = sorted(HISTORY_DIR.glob('*.json'))
+    if not files:
+        return None
+    if bo_qua_path:
+        files = [f for f in files if str(f) != str(bo_qua_path)]
     if not files:
         return None
     return json.loads(files[-1].read_text(encoding='utf-8'))
 
 
 def so_sanh_voi_hom_truoc(payload_viet):
-    truoc = doc_lich_su_hom_truoc()
+    truoc = doc_lich_su_hom_truoc(payload_viet.get('tep_lich_su'))
     if not truoc:
         return {
             'co_so_sanh': False,
@@ -509,15 +648,31 @@ def dien_giai_do_rong_mo_rong(scan):
     }
 
 
-def bao_cao_ngay_mai(symbols, top=5, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_vao_lenh=0.2, cho_phep_vuot=False, he_so_vuot_mac_dinh=1.0):
+def tom_tat_chat_luong_du_lieu(rows, scan, portfolio_file=None):
+    warnings = []
+    stale_intraday = [x['symbol'] for x in scan.get('all', []) if (x.get('freshness', {}).get('m15_status') not in ('fresh', None))]
+    stale_h1 = [x['symbol'] for x in scan.get('all', []) if x.get('freshness', {}).get('h1_status') == 'stale']
+    if stale_intraday:
+        warnings.append(f'Dữ liệu intraday chưa tươi hoàn toàn ở: {", ".join(stale_intraday[:8])}')
+    if stale_h1:
+        warnings.append(f'Dữ liệu H1 đã cũ ở: {", ".join(stale_h1[:8])}')
+    if scan.get('errors'):
+        warnings.append(f'Có {len(scan.get("errors", []))} mã lỗi khi quét dữ liệu.')
+    if portfolio_file and not Path(portfolio_file).exists():
+        warnings.append('Chưa có file danh mục để tự động gắn giá vốn/vị thế.')
+    return warnings
+
+
+def bao_cao_ngay_mai(symbols, top=5, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_vao_lenh=0.2, cho_phep_vuot=False, he_so_vuot_mac_dinh=1.0, mode='balanced', portfolio_file=None):
+    portfolio_map = load_portfolio(portfolio_file or DEFAULT_PORTFOLIO_FILE)
     scan = run_json(['python3', str(SCAN), *symbols])
     news = run_json(['python3', str(NEWS), *symbols, '--limit', '6'])
-    merged = tron_du_lieu(scan, news)
+    merged = tron_du_lieu(scan, news, mode=mode)
     shortlist = []
     for row in merged:
         if row['final_label'] in ('PROPOSE', 'PROMOTE_TO_WATCHPLUS', 'WATCH', 'CAUTION'):
-            shortlist.append(viet_hoa_mot_dong(row, tai_khoan, rui_ro_phan_tram, ti_le_toi_da_vao_lenh, cho_phep_vuot, he_so_vuot_mac_dinh))
-    shortlist = shortlist[:top]
+            shortlist.append(viet_hoa_mot_dong(row, tai_khoan, rui_ro_phan_tram, ti_le_toi_da_vao_lenh, cho_phep_vuot, he_so_vuot_mac_dinh, scan.get('market_context'), mode, portfolio_map))
+    shortlist = sorted(shortlist, key=lambda x: x.get('xep_hang_hanh_dong', -1), reverse=True)[:top]
 
     danh_sach_theo_doi_thi_truong_xau = []
     if not shortlist:
@@ -534,17 +689,20 @@ def bao_cao_ngay_mai(symbols, top=5, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le
         if not ung_vien_theo_doi:
             ung_vien_theo_doi = merged[:3]
         danh_sach_theo_doi_thi_truong_xau = [
-            viet_hoa_mot_dong(row, tai_khoan, rui_ro_phan_tram, ti_le_toi_da_vao_lenh, cho_phep_vuot, he_so_vuot_mac_dinh)
+            viet_hoa_mot_dong(row, tai_khoan, rui_ro_phan_tram, ti_le_toi_da_vao_lenh, cho_phep_vuot, he_so_vuot_mac_dinh, scan.get('market_context'), mode, portfolio_map)
             for row in ung_vien_theo_doi[:3]
         ]
 
     payload_viet = {
         'thoi_gian': scan['ts'],
+        'che_do_giao_dich': MODE_CONFIG.get(mode, MODE_CONFIG['balanced'])['label'],
         'tham_so_quan_tri_von': {
             'tai_khoan': tai_khoan,
             'rui_ro_moi_lenh_phan_tram': rui_ro_phan_tram,
             'ti_le_toi_da_vao_lenh': ti_le_toi_da_vao_lenh,
+            'portfolio_file': str(portfolio_file or DEFAULT_PORTFOLIO_FILE),
         },
+        'boi_canh_thi_truong': scan.get('market_context'),
         'do_rong_thi_truong': {
             'so_ma_tang': scan.get('breadth', {}).get('advance'),
             'so_ma_giam': scan.get('breadth', {}).get('decline'),
@@ -586,12 +744,13 @@ def bao_cao_ngay_mai(symbols, top=5, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le
             }
             for x in scan.get('breadth_extended', {}).get('sector_strength', [])[:8]
         ],
+        'chat_luong_du_lieu': tom_tat_chat_luong_du_lieu(merged, scan, portfolio_file or DEFAULT_PORTFOLIO_FILE),
         'danh_sach_ngan_han': shortlist,
         'danh_sach_theo_doi_thi_truong_xau': danh_sach_theo_doi_thi_truong_xau,
     }
-    payload_viet['so_sanh_voi_lan_truoc'] = so_sanh_voi_hom_truoc(payload_viet)
     duong_dan = luu_lich_su(payload_viet)
     payload_viet['tep_lich_su'] = duong_dan
+    payload_viet['so_sanh_voi_lan_truoc'] = so_sanh_voi_hom_truoc(payload_viet)
     return payload_viet
 
 
@@ -604,6 +763,8 @@ def main():
     parser.add_argument('--ti-le-toi-da', type=float, default=0.2)
     parser.add_argument('--cho-phep-vuot', action='store_true')
     parser.add_argument('--he-so-vuot', type=float, default=1.0)
+    parser.add_argument('--mode', choices=sorted(MODE_CONFIG.keys()), default='balanced')
+    parser.add_argument('--portfolio-file', type=str, default=str(DEFAULT_PORTFOLIO_FILE))
     args = parser.parse_args()
     symbols = args.symbols or [
         'VHM', 'VIC', 'VCB', 'CTG', 'BID', 'MBB', 'ACB', 'TCB',
@@ -618,6 +779,8 @@ def main():
         ti_le_toi_da_vao_lenh=args.ti_le_toi_da,
         cho_phep_vuot=args.cho_phep_vuot,
         he_so_vuot_mac_dinh=args.he_so_vuot,
+        mode=args.mode,
+        portfolio_file=args.portfolio_file,
     )
     print(json.dumps(payload, ensure_ascii=False))
 

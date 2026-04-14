@@ -1,0 +1,7 @@
+{
+  "positions": {
+    "VIC": {"quantity": 15, "avg_price": 159.1, "t_plus": 0, "note": "mới mua"},
+    "TCB": {"quantity": 900, "avg_price": 32.4, "t_plus": 1},
+    "NVL": {"quantity": 100, "avg_price": 17.15, "t_plus": 1}
+  }
+}

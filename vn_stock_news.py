@@ -10,16 +10,16 @@ POSITIVE_KEYWORDS = [
     'tăng trần', 'bứt phá', 'mua ròng', 'cổ tức', 'lợi nhuận', 'kỷ lục',
     'hưởng lợi', 'tăng trưởng', 'vượt đỉnh', 'khuyến nghị mua', 'mở rộng',
     'động lực', 'hồi phục', 'bệ đỡ', 'tích cực', 'đỡ thị trường', 'dẫn sóng',
-    'kế hoạch', 'thoái vốn', 'mục tiêu', 'mua vào'
+    'kế hoạch', 'thoái vốn', 'mục tiêu', 'mua vào', 'hé lộ kết quả kinh doanh'
 ]
 NEGATIVE_KEYWORDS = [
     'bán ròng', 'giảm sàn', 'chốt lời', 'áp lực bán', 'điều chỉnh', 'suy giảm',
     'cảnh báo', 'rủi ro', 'khởi tố', 'thanh tra', 'thua lỗ', 'nợ xấu',
-    'pha loãng', 'trì hoãn', 'tiêu cực', 'xả', 'bị bán', 'thoát hàng'
+    'pha loãng', 'trì hoãn', 'tiêu cực', 'xả', 'bị bán', 'thoát hàng', 'ngập ngừng'
 ]
 SHORT_TERM_POSITIVE = ['tăng trần', 'bứt phá', 'đỡ thị trường', 'dẫn sóng', 'mua ròng', 'khuyến nghị mua', 'vượt đỉnh', 'hồi phục']
 SHORT_TERM_NEGATIVE = ['bán ròng', 'giảm sàn', 'chốt lời', 'áp lực bán', 'điều chỉnh', 'xả', 'thoát hàng']
-MEDIUM_TERM_POSITIVE = ['cổ tức', 'lợi nhuận', 'kỷ lục', 'tăng trưởng', 'mở rộng', 'thoái vốn', 'mục tiêu', 'kế hoạch', 'hưởng lợi']
+MEDIUM_TERM_POSITIVE = ['cổ tức', 'lợi nhuận', 'kỷ lục', 'tăng trưởng', 'mở rộng', 'thoái vốn', 'mục tiêu', 'kế hoạch', 'hưởng lợi', 'kết quả kinh doanh']
 MEDIUM_TERM_NEGATIVE = ['thua lỗ', 'nợ xấu', 'pha loãng', 'trì hoãn', 'khởi tố', 'thanh tra', 'cảnh báo', 'rủi ro']
 SOURCE_BONUS = {
     'vnexpress.net': 2,
@@ -98,14 +98,19 @@ def score_headline(title, source='', age_hours=None):
             score += bonus
             hits.append(f'source:{host_kw}')
             break
+    freshness = 'unknown'
     if age_hours is not None:
         if age_hours <= 24:
             score += 1
             hits.append('fresh')
-        elif age_hours > 72:
+            freshness = 'fresh'
+        elif age_hours <= 72:
+            freshness = 'recent'
+        else:
             score -= 1
             hits.append('stale')
-    return score, hits
+            freshness = 'stale'
+    return score, hits, freshness
 
 
 def tom_tat_tieu_de(title):
@@ -123,6 +128,29 @@ def diem_theo_nhom_tu_khoa(title, keywords):
     return sum(1 for kw in keywords if kw in text)
 
 
+def impact_from_score(score):
+    if score >= 4:
+        return 'mạnh'
+    if score >= 1:
+        return 'vừa'
+    if score <= -4:
+        return 'mạnh'
+    if score <= -1:
+        return 'vừa'
+    return 'yếu'
+
+
+def classify_news_type(title):
+    text = (title or '').lower()
+    if any(x in text for x in ['lợi nhuận', 'kết quả kinh doanh', 'cổ tức', 'đhcđ', 'mục tiêu', 'kế hoạch']):
+        return 'tin doanh nghiệp'
+    if any(x in text for x in ['mua ròng', 'bán ròng', 'cổ đông lớn', 'gom thêm', 'thoái vốn']):
+        return 'tin dòng tiền'
+    if any(x in text for x in ['lãi suất', 'vĩ mô', 'tỷ giá', 'vn-index', 'thị trường']):
+        return 'tin vĩ mô/thị trường'
+    return 'tin tổng hợp'
+
+
 def danh_gia_xu_the_tin(items, total_score):
     short_score = 0
     medium_score = 0
@@ -135,17 +163,6 @@ def danh_gia_xu_the_tin(items, total_score):
         medium_score -= diem_theo_nhom_tu_khoa(title, MEDIUM_TERM_NEGATIVE)
 
         score = it.get('score', 0)
-        if score >= 3:
-            muc = 'mạnh'
-        elif score >= 1:
-            muc = 'vừa'
-        elif score <= -3:
-            muc = 'mạnh'
-        elif score <= -1:
-            muc = 'vừa'
-        else:
-            muc = 'yếu'
-
         if score > 0:
             nghieng = 'tích cực'
         elif score < 0:
@@ -162,8 +179,10 @@ def danh_gia_xu_the_tin(items, total_score):
                 'gio_dang': it.get('pubDate'),
                 'so_gio_truoc': it.get('age_hours'),
                 'nghieng': nghieng,
-                'muc_anh_huong': muc,
+                'muc_anh_huong': impact_from_score(score),
                 'thoi_gian_anh_huong': 'ngắn hạn' if abs(short_score) >= abs(medium_score) else 'trung hạn',
+                'loai_tin': it.get('news_type'),
+                'freshness': it.get('freshness'),
             })
 
     if short_score >= 3:
@@ -220,7 +239,7 @@ def score_symbol_news(symbol, limit=8):
     total = 0
     for it in items:
         age = hours_ago(it.get('pubDate'))
-        sc, hits = score_headline(it.get('title', ''), it.get('link', '') + ' ' + it.get('source', ''), age)
+        sc, hits, freshness = score_headline(it.get('title', ''), it.get('link', '') + ' ' + it.get('source', ''), age)
         total += sc
         scored.append({
             **it,
@@ -231,8 +250,12 @@ def score_symbol_news(symbol, limit=8):
             'nguon_hien_thi': it.get('source') or '',
             'duong_dan_goc': it.get('link') or '',
             'diem_uu_tien_nguon': diem_uu_tien_nguon(it.get('source')),
+            'freshness': freshness,
+            'impact_level': impact_from_score(sc),
+            'news_type': classify_news_type(it.get('title', '')),
+            'price_relevance': 'cao' if freshness == 'fresh' and abs(sc) >= 3 else 'vừa' if abs(sc) >= 1 else 'thấp',
         })
-    scored.sort(key=lambda x: (x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
+    scored.sort(key=lambda x: (x.get('freshness') == 'fresh', x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
     verdict = 'neutral'
     if total >= 5:
         verdict = 'positive'

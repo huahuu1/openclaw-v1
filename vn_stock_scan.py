@@ -2,6 +2,7 @@ import argparse
 import json
 import time
 import urllib.request
+from datetime import datetime, timezone
 from statistics import mean
 
 BASE = "https://services.entrade.com.vn/chart-api/v2/ohlcs/stock"
@@ -38,6 +39,28 @@ SECTOR_MAP = {
 }
 
 
+def ts_to_iso(ts):
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+
+
+def now_ts():
+    return int(time.time())
+
+
+def compute_freshness_age_minutes(ts):
+    return round((now_ts() - int(ts)) / 60, 1)
+
+
+def classify_freshness(age_minutes, timeframe):
+    thresholds = {"1D": 24 * 60 * 3, "1H": 180, "15m": 45}
+    limit = thresholds.get(timeframe, 120)
+    if age_minutes <= limit:
+        return "fresh"
+    if age_minutes <= limit * 2:
+        return "delayed"
+    return "stale"
+
+
 def http_get_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
@@ -45,7 +68,7 @@ def http_get_json(url):
 
 
 def fetch_ohlc(symbol, resolution="1D", bars=260):
-    now = int(time.time())
+    now = now_ts()
     if resolution == "1D":
         lookback = bars * 86400 * 2
     elif resolution in ("1H", "60"):
@@ -182,6 +205,8 @@ def score_breadth_symbol(symbol, daily_rows):
     e20 = ema(dclose[-60:], 20)
     rv20 = rel_volume(daily_rows, 20)
     chg1 = pct_change(close, prev_close)
+    latest_ts = daily_rows[-1]["t"]
+    age_min = compute_freshness_age_minutes(latest_ts)
     return {
         "symbol": symbol,
         "close": round(close, 2),
@@ -190,6 +215,9 @@ def score_breadth_symbol(symbol, daily_rows):
         "rel_volume20": round(rv20, 2) if rv20 is not None else None,
         "above_ema20": bool(e20 and close > e20),
         "sector": SECTOR_MAP.get(symbol, "other"),
+        "as_of": latest_ts,
+        "as_of_iso": ts_to_iso(latest_ts),
+        "freshness": classify_freshness(age_min, "1D"),
     }
 
 
@@ -351,6 +379,21 @@ def score_symbol(symbol, daily_rows, h1_rows, m15_rows):
     if m_e20 and mclose[-1] < m_e20:
         notes.append("m15_not_confirmed")
 
+    daily_ts = daily_rows[-1]["t"]
+    h1_ts = h1_rows[-1]["t"]
+    m15_ts = m15_rows[-1]["t"]
+    daily_age = compute_freshness_age_minutes(daily_ts)
+    h1_age = compute_freshness_age_minutes(h1_ts)
+    m15_age = compute_freshness_age_minutes(m15_ts)
+
+    data_quality_warnings = []
+    if classify_freshness(daily_age, "1D") != "fresh":
+        data_quality_warnings.append("daily_data_not_fresh")
+    if classify_freshness(h1_age, "1H") == "stale":
+        data_quality_warnings.append("h1_data_stale")
+    if classify_freshness(m15_age, "15m") != "fresh":
+        data_quality_warnings.append("intraday_data_not_fresh")
+
     return {
         "symbol": symbol,
         "sector": SECTOR_MAP.get(symbol, "other"),
@@ -372,11 +415,66 @@ def score_symbol(symbol, daily_rows, h1_rows, m15_rows):
         "risk_pct_to_stop": round(risk_pct, 2),
         "h1_trend_ok": bool(h_e20 and h_e50 and hclose[-1] > h_e20 and h_e20 >= h_e50),
         "m15_trigger_ok": bool(m_e20 and mclose[-1] > m_e20),
+        "score_breakdown": {
+            "trend_score": trend_score,
+            "quality_score": quality_score,
+            "momentum_score": momentum_score,
+            "risk_score": risk_score,
+            "trigger_score": trigger_score,
+            "penalty": penalty,
+            "base_total": total,
+        },
         "score": total,
         "penalty": penalty,
         "verdict": verdict,
         "notes": notes,
-        "as_of": daily_rows[-1]["t"],
+        "as_of": daily_ts,
+        "data_timestamps": {
+            "daily": daily_ts,
+            "daily_iso": ts_to_iso(daily_ts),
+            "h1": h1_ts,
+            "h1_iso": ts_to_iso(h1_ts),
+            "m15": m15_ts,
+            "m15_iso": ts_to_iso(m15_ts),
+        },
+        "freshness": {
+            "daily_age_minutes": daily_age,
+            "h1_age_minutes": h1_age,
+            "m15_age_minutes": m15_age,
+            "daily_status": classify_freshness(daily_age, "1D"),
+            "h1_status": classify_freshness(h1_age, "1H"),
+            "m15_status": classify_freshness(m15_age, "15m"),
+        },
+        "data_quality_warnings": data_quality_warnings,
+    }
+
+
+def derive_market_context(payload):
+    breadth = payload.get("breadth", {})
+    breadth_extended = payload.get("breadth_extended", {})
+    adv_ratio = breadth_extended.get("advance_ratio") or breadth.get("advance_ratio") or 0
+    above_ema20_ratio = breadth_extended.get("above_ema20_ratio") or 0
+    strong_volume_ratio = breadth_extended.get("strong_volume_ratio") or 0
+    sector_strength = payload.get("sector_strength", [])
+    leaders = [x.get("sector") for x in sector_strength[:3] if x.get("sector")]
+
+    if adv_ratio >= 0.55 and above_ema20_ratio >= 0.55:
+        regime = "risk_on"
+        regime_text = "Lan tỏa tích cực, có thể chủ động hơn với mã mạnh."
+    elif adv_ratio <= 0.35 and above_ema20_ratio <= 0.45:
+        regime = "risk_off"
+        regime_text = "Thị trường yếu, nên ưu tiên phòng thủ và tránh mua đuổi."
+    else:
+        regime = "mixed"
+        regime_text = "Thị trường phân hóa, nên chọn lọc rất kỹ."
+
+    return {
+        "regime": regime,
+        "regime_text": regime_text,
+        "advance_ratio": round(adv_ratio, 2),
+        "above_ema20_ratio": round(above_ema20_ratio, 2),
+        "strong_volume_ratio": round(strong_volume_ratio, 2),
+        "leading_sectors": leaders,
     }
 
 
@@ -399,8 +497,8 @@ def scan(symbols):
     sectors = calc_sector_strength(out)
     breadth_extended = scan_extended_breadth()
 
-    return {
-        "ts": int(time.time()),
+    payload = {
+        "ts": now_ts(),
         "market": "VN",
         "timeframes": {"trend": "1D", "confirm": "1H", "trigger": "15m"},
         "universe": symbols,
@@ -413,6 +511,8 @@ def scan(symbols):
         "errors": errors,
         "all": out,
     }
+    payload["market_context"] = derive_market_context(payload)
+    return payload
 
 
 def main():
@@ -429,6 +529,8 @@ def main():
         compact = {
             "ts": payload["ts"],
             "breadth": payload["breadth"],
+            "breadth_extended": payload["breadth_extended"],
+            "market_context": payload["market_context"],
             "sector_strength": payload["sector_strength"][:5],
             "proposals": payload["proposals"][:args.top],
             "watch": payload["watch"][:args.top],
