@@ -110,7 +110,32 @@ python3 vn_stock_report.py VIC TCB NVL --portfolio-file examples/vn_portfolio.ex
 - Trước vào lệnh: chạy `vn_stock_report.py ... --mode scalp|swing`
 - Cuối ngày: chạy lại report để xem market context + shortlist
 
-## 9. Lưu ý
+## 9. Command dùng nhanh
+### Command Python trực tiếp
+```bash
+python3 vn_stock_scan.py VIC TCB NVL --compact --top 3
+python3 vn_stock_news.py VIC TCB NVL --limit 6
+python3 vn_stock_report.py --top 6 --mode balanced --tai-khoan 30000000 --rui-ro 1 --ti-le-toi-da 0.35
+python3 vn_stock_report.py VIC TCB NVL --mode swing --portfolio-file memory/vn_portfolio.json
+```
+
+### Command chat/skill nên dùng
+```text
+/vn_top
+/vn_top 6
+/vn_top --mode balanced
+/vn_top 6 --mode swing
+/vn_top VIC TCB NVL HPG --top 6
+/vn_top --top 6 --tai-khoan 30000000 --rui-ro 1 --ti-le-toi-da 0.35
+```
+
+### Khi nào dùng command nào
+- Muốn quét nhanh kỹ thuật: `vn_stock_scan.py`
+- Muốn xem news flow nhanh: `vn_stock_news.py`
+- Muốn ra quyết định có vùng mua/dừng lỗ/chốt lời: `vn_stock_report.py`
+- Muốn lấy top cơ hội theo format chat: `/vn_top`
+
+## 10. Lưu ý
 - Đây là công cụ hỗ trợ quyết định, không phải cam kết lợi nhuận
 - Với mã nóng, luôn kiểm tra freshness và warning trước khi hành động
 - Nếu market context là `risk_off`, ưu tiên phòng thủ hơn là cố tìm điểm mua đẹp
