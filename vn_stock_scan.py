@@ -1,9 +1,15 @@
 import argparse
 import json
+import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
 from statistics import mean
+
+
+def log(msg):
+    """Print progress log to stderr so it doesn't pollute JSON stdout."""
+    print(f"[scan] {msg}", file=sys.stderr, flush=True)
 
 BASE = "https://services.entrade.com.vn/chart-api/v2/ohlcs/stock"
 TIMEOUT = 15
@@ -257,16 +263,22 @@ def score_breadth_symbol(symbol, daily_rows):
 
 def scan_extended_breadth(symbols=None):
     symbols = symbols or EXTENDED_BREADTH_UNIVERSE
+    total = len(symbols)
+    log(f"== Extended breadth scan: {total} symbols ==")
+    t0 = time.time()
     out = []
     errors = []
-    for symbol in symbols:
+    for idx, symbol in enumerate(symbols, 1):
         try:
+            log(f"  breadth [{idx}/{total}] {symbol}")
             daily_rows = fetch_ohlc(symbol, resolution="1D", bars=80)
             if len(daily_rows) < 25:
                 raise ValueError(f"Not enough daily bars: D={len(daily_rows)}")
             out.append(score_breadth_symbol(symbol, daily_rows))
         except Exception as e:
+            log(f"  breadth [{idx}/{total}] {symbol} ERROR: {e}")
             errors.append({"symbol": symbol, "error": str(e)})
+    log(f"== Extended breadth done: {len(out)} ok, {len(errors)} errors, {time.time()-t0:.1f}s ==")
     adv = sum(1 for x in out if (x.get("change_pct_1d") or 0) > 0)
     dec = sum(1 for x in out if (x.get("change_pct_1d") or 0) < 0)
     flat = sum(1 for x in out if (x.get("change_pct_1d") or 0) == 0)
@@ -513,22 +525,33 @@ def derive_market_context(payload):
 
 
 def scan(symbols, breadth_symbols=None):
+    total = len(symbols)
+    log(f"== Main scan: {total} symbols ==")
+    scan_t0 = time.time()
     out = []
     errors = []
-    for symbol in symbols:
+    for idx, symbol in enumerate(symbols, 1):
         try:
+            sym_t0 = time.time()
+            log(f"  scan [{idx}/{total}] {symbol} - fetching D/H1/M15...")
             daily_rows = fetch_ohlc(symbol, resolution="1D", bars=260)
             h1_rows = fetch_ohlc(symbol, resolution="1H", bars=140)
             m15_rows = fetch_ohlc(symbol, resolution="15", bars=180)
             if len(daily_rows) < 80 or len(h1_rows) < 40 or len(m15_rows) < 40:
                 raise ValueError(f"Not enough bars: D={len(daily_rows)} H1={len(h1_rows)} M15={len(m15_rows)}")
-            out.append(score_symbol(symbol, daily_rows, h1_rows, m15_rows))
+            result = score_symbol(symbol, daily_rows, h1_rows, m15_rows)
+            out.append(result)
+            log(f"  scan [{idx}/{total}] {symbol} -> {result['verdict']} (score={result['score']}) {time.time()-sym_t0:.1f}s")
         except Exception as e:
+            log(f"  scan [{idx}/{total}] {symbol} ERROR: {e}")
             errors.append({"symbol": symbol, "error": str(e)})
+    log(f"== Main scan done: {len(out)} ok, {len(errors)} errors, {time.time()-scan_t0:.1f}s ==")
     out.sort(key=lambda x: (x["score"], x["change_pct_20d"] or -999, x["rel_volume20"] or 0), reverse=True)
 
+    log("Calculating breadth & sector strength...")
     breadth = calc_breadth(out)
     sectors = calc_sector_strength(out)
+    log(f"Starting extended breadth scan ({len(breadth_symbols or [])} symbols)...")
     breadth_extended = scan_extended_breadth(breadth_symbols)
 
     payload = {
@@ -570,7 +593,10 @@ def main():
     else:
         breadth_symbols = BROAD_UNIVERSE if len(symbols) <= len(CORE_UNIVERSE) else symbols
 
+    log(f"Universe: {len(symbols)} symbols, breadth: {len(breadth_symbols)} symbols, mode={args.mode}")
+    t_total = time.time()
     payload = scan(symbols, breadth_symbols=breadth_symbols)
+    log(f"Total scan completed in {time.time()-t_total:.1f}s")
 
     if args.compact:
         compact = {
