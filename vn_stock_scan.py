@@ -7,7 +7,7 @@ from statistics import mean
 
 BASE = "https://services.entrade.com.vn/chart-api/v2/ohlcs/stock"
 TIMEOUT = 15
-DEFAULT_UNIVERSE = [
+CORE_UNIVERSE = [
     "VHM", "VIC", "VCB", "CTG", "BID", "MBB", "ACB", "TCB",
     "FPT", "HPG", "SSI", "VCI", "HCM", "REE", "GMD", "VNM",
     "MWG", "PNJ", "DGC", "MSN", "GAS", "PVD", "PVS", "KDH", "NLG"
@@ -28,7 +28,8 @@ EXTENDED_BREADTH_UNIVERSE = [
     "GAS", "GEG", "HDC", "IDC", "IDC", "ITA", "KHG", "MSH", "NAB", "NTP",
     "ORS", "PHR", "QNS", "SCS", "SHS", "TNG", "VEA", "VHC", "VGI", "VGS"
 ]
-EXTENDED_BREADTH_UNIVERSE = list(dict.fromkeys(DEFAULT_UNIVERSE + EXTENDED_BREADTH_UNIVERSE))[:150]
+EXTENDED_BREADTH_UNIVERSE = list(dict.fromkeys(CORE_UNIVERSE + EXTENDED_BREADTH_UNIVERSE))[:150]
+BROAD_UNIVERSE = EXTENDED_BREADTH_UNIVERSE[:]
 SECTOR_MAP = {
     "VHM": "real_estate", "VIC": "real_estate", "KDH": "real_estate", "NLG": "real_estate",
     "VCB": "bank", "CTG": "bank", "BID": "bank", "MBB": "bank", "ACB": "bank", "TCB": "bank",
@@ -37,6 +38,39 @@ SECTOR_MAP = {
     "HPG": "steel", "DGC": "chemicals", "GAS": "energy", "PVD": "energy", "PVS": "energy",
     "REE": "utilities", "GMD": "logistics", "VNM": "consumer"
 }
+
+
+def normalize_symbols(symbols):
+    out = []
+    seen = set()
+    for symbol in symbols or []:
+        s = str(symbol).strip().upper()
+        if not s:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def load_universe_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    tokens = []
+    for part in raw.replace(",", " ").replace("\n", " ").replace("\t", " ").split(" "):
+        if part.strip():
+            tokens.append(part.strip())
+    return normalize_symbols(tokens)
+
+
+def resolve_universe(args):
+    if args.symbols:
+        return normalize_symbols(args.symbols)
+    if args.universe_file:
+        return load_universe_file(args.universe_file)
+    if args.mode == "broad":
+        return BROAD_UNIVERSE
+    return CORE_UNIVERSE
 
 
 def ts_to_iso(ts):
@@ -478,7 +512,7 @@ def derive_market_context(payload):
     }
 
 
-def scan(symbols):
+def scan(symbols, breadth_symbols=None):
     out = []
     errors = []
     for symbol in symbols:
@@ -495,7 +529,7 @@ def scan(symbols):
 
     breadth = calc_breadth(out)
     sectors = calc_sector_strength(out)
-    breadth_extended = scan_extended_breadth()
+    breadth_extended = scan_extended_breadth(breadth_symbols)
 
     payload = {
         "ts": now_ts(),
@@ -520,10 +554,23 @@ def main():
     parser.add_argument("symbols", nargs="*", help="Symbols to scan, e.g. VHM VCB HPG")
     parser.add_argument("--top", type=int, default=5, help="How many top names to print in compact mode")
     parser.add_argument("--compact", action="store_true", help="Print only compact shortlist")
+    parser.add_argument("--mode", choices=["core", "broad"], default="core", help="Universe mode when no explicit symbols are passed")
+    parser.add_argument("--universe-file", help="Path to a file containing symbols separated by spaces, commas, or newlines")
+    parser.add_argument("--breadth-mode", choices=["core", "broad", "auto"], default="broad", help="Universe used for market breadth context")
     args = parser.parse_args()
 
-    symbols = args.symbols or DEFAULT_UNIVERSE
-    payload = scan(symbols)
+    symbols = resolve_universe(args)
+    if not symbols:
+        raise SystemExit("No symbols provided after resolving universe")
+
+    if args.breadth_mode == "core":
+        breadth_symbols = CORE_UNIVERSE
+    elif args.breadth_mode == "broad":
+        breadth_symbols = BROAD_UNIVERSE
+    else:
+        breadth_symbols = BROAD_UNIVERSE if len(symbols) <= len(CORE_UNIVERSE) else symbols
+
+    payload = scan(symbols, breadth_symbols=breadth_symbols)
 
     if args.compact:
         compact = {
