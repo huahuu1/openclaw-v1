@@ -81,6 +81,19 @@ def hours_ago(pub_date):
         return None
 
 
+def is_reference_headline(title):
+    text = (title or '').strip().lower()
+    if not text:
+        return False
+    if ': công ty' in text or ': ctcp' in text:
+        return True
+    if 'chứng quyền' in text:
+        return True
+    if text.startswith('hose: ') or text.startswith('hnx: ') or text.startswith('upcom: '):
+        return True
+    return False
+
+
 def score_headline(title, source='', age_hours=None):
     text = title.lower()
     score = 0
@@ -101,15 +114,26 @@ def score_headline(title, source='', age_hours=None):
     freshness = 'unknown'
     if age_hours is not None:
         if age_hours <= 24:
-            score += 1
+            score += 2
             hits.append('fresh')
             freshness = 'fresh'
         elif age_hours <= 72:
+            score += 1
+            hits.append('recent')
             freshness = 'recent'
-        else:
-            score -= 1
+        elif age_hours <= 7 * 24:
+            freshness = 'aging'
+        elif age_hours <= 30 * 24:
+            score -= 2
             hits.append('stale')
             freshness = 'stale'
+        else:
+            score -= 4
+            hits.append('very_stale')
+            freshness = 'very_stale'
+    if is_reference_headline(title):
+        score -= 3
+        hits.append('reference_like')
     return score, hits, freshness
 
 
@@ -151,16 +175,34 @@ def classify_news_type(title):
     return 'tin tổng hợp'
 
 
+def classify_catalyst_flag(short_items, medium_items):
+    if short_items:
+        return 'co_catalyst_moi'
+    if medium_items:
+        return 'chi_co_tin_trung_han'
+    return 'thieu_catalyst_moi'
+
+
 def danh_gia_xu_the_tin(items, total_score):
     short_score = 0
     medium_score = 0
     cac_anh_huong = []
-    for it in items[:5]:
+    usable_items = [
+        it for it in items
+        if it.get('freshness') in ('fresh', 'recent', 'aging') and not is_reference_headline(it.get('title', ''))
+    ]
+    short_term_items = [it for it in usable_items if (it.get('age_hours') is not None and it.get('age_hours') <= 72)]
+    medium_term_items = [it for it in usable_items if (it.get('age_hours') is not None and 72 < it.get('age_hours') <= 30 * 24)]
+
+    for it in usable_items[:5]:
         title = it.get('title', '')
-        short_score += diem_theo_nhom_tu_khoa(title, SHORT_TERM_POSITIVE)
-        short_score -= diem_theo_nhom_tu_khoa(title, SHORT_TERM_NEGATIVE)
-        medium_score += diem_theo_nhom_tu_khoa(title, MEDIUM_TERM_POSITIVE)
-        medium_score -= diem_theo_nhom_tu_khoa(title, MEDIUM_TERM_NEGATIVE)
+        age_hours = it.get('age_hours')
+        if age_hours is not None and age_hours <= 72:
+            short_score += diem_theo_nhom_tu_khoa(title, SHORT_TERM_POSITIVE)
+            short_score -= diem_theo_nhom_tu_khoa(title, SHORT_TERM_NEGATIVE)
+        if age_hours is not None and age_hours <= 30 * 24:
+            medium_score += diem_theo_nhom_tu_khoa(title, MEDIUM_TERM_POSITIVE)
+            medium_score -= diem_theo_nhom_tu_khoa(title, MEDIUM_TERM_NEGATIVE)
 
         score = it.get('score', 0)
         if score > 0:
@@ -180,7 +222,7 @@ def danh_gia_xu_the_tin(items, total_score):
                 'so_gio_truoc': it.get('age_hours'),
                 'nghieng': nghieng,
                 'muc_anh_huong': impact_from_score(score),
-                'thoi_gian_anh_huong': 'ngắn hạn' if abs(short_score) >= abs(medium_score) else 'trung hạn',
+                'thoi_gian_anh_huong': 'ngắn hạn' if age_hours is not None and age_hours <= 72 else 'trung hạn',
                 'loai_tin': it.get('news_type'),
                 'freshness': it.get('freshness'),
             })
@@ -216,11 +258,33 @@ def danh_gia_xu_the_tin(items, total_score):
         do_tin_cay = 'thấp'
 
     return {
+        'news_score_short_term': sum(it.get('score', 0) for it in short_term_items),
+        'news_score_medium_term': sum(it.get('score', 0) for it in medium_term_items),
         'tac_dong_ngan_han': tac_dong_ngan_han,
         'tac_dong_trung_han': tac_dong_trung_han,
         'ket_luan_xu_the_tin': ket_luan,
         'do_tin_cay_xu_the_tin': do_tin_cay,
+        'short_term_count': len(short_term_items),
+        'medium_term_count': len(medium_term_items),
+        'catalyst_flag': classify_catalyst_flag(short_term_items, medium_term_items),
         'tin_tom_tat': cac_anh_huong[:3],
+        'tin_ngan_han': cac_anh_huong[:3] if short_term_items else [],
+        'tin_trung_han': [
+            {
+                'tieu_de': it.get('title'),
+                'tom_tat': tom_tat_tieu_de(it.get('title')),
+                'nguon': it.get('source'),
+                'duong_dan': it.get('link'),
+                'gio_dang': it.get('pubDate'),
+                'so_gio_truoc': it.get('age_hours'),
+                'nghieng': 'tích cực' if it.get('score', 0) > 0 else 'tiêu cực' if it.get('score', 0) < 0 else 'trung tính',
+                'muc_anh_huong': impact_from_score(it.get('score', 0)),
+                'thoi_gian_anh_huong': 'trung hạn',
+                'loai_tin': it.get('news_type'),
+                'freshness': it.get('freshness'),
+            }
+            for it in medium_term_items[:3]
+        ],
     }
 
 
@@ -236,11 +300,9 @@ def score_symbol_news(symbol, limit=8):
     query = f'{symbol} chứng khoán'
     items = parse_google_news_rss(query, limit=limit)
     scored = []
-    total = 0
     for it in items:
         age = hours_ago(it.get('pubDate'))
         sc, hits, freshness = score_headline(it.get('title', ''), it.get('link', '') + ' ' + it.get('source', ''), age)
-        total += sc
         scored.append({
             **it,
             'age_hours': round(age, 1) if age is not None else None,
@@ -253,22 +315,37 @@ def score_symbol_news(symbol, limit=8):
             'freshness': freshness,
             'impact_level': impact_from_score(sc),
             'news_type': classify_news_type(it.get('title', '')),
-            'price_relevance': 'cao' if freshness == 'fresh' and abs(sc) >= 3 else 'vừa' if abs(sc) >= 1 else 'thấp',
+            'price_relevance': 'cao' if freshness in ('fresh', 'recent') and abs(sc) >= 3 else 'vừa' if freshness in ('fresh', 'recent', 'aging') and abs(sc) >= 1 else 'thấp',
+            'is_reference_like': is_reference_headline(it.get('title', '')),
         })
-    scored.sort(key=lambda x: (x.get('freshness') == 'fresh', x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
+    scored.sort(key=lambda x: (x.get('freshness') == 'fresh', x.get('freshness') == 'recent', x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
+    usable_for_score = [
+        x for x in scored
+        if x.get('freshness') in ('fresh', 'recent', 'aging') and not x.get('is_reference_like')
+    ]
+    display_items = [
+        x for x in usable_for_score
+        if (x.get('age_hours') is not None and x.get('age_hours') <= 7 * 24)
+    ]
+    total = sum(x.get('score', 0) for x in usable_for_score)
     verdict = 'neutral'
     if total >= 5:
         verdict = 'positive'
     elif total <= -5:
         verdict = 'negative'
-    xu_the_tin = danh_gia_xu_the_tin(scored, total)
+    xu_the_tin = danh_gia_xu_the_tin(usable_for_score, total)
     return {
         'symbol': symbol,
         'query': query,
         'news_score': total,
         'verdict': verdict,
         'items': scored,
+        'items_usable': usable_for_score,
+        'news_quality_flag': 'fresh_or_recent' if any(x.get('freshness') in ('fresh', 'recent') for x in usable_for_score) else 'aging_only' if usable_for_score else 'no_usable_news',
         **xu_the_tin,
+        'tin_tom_tat': xu_the_tin.get('tin_tom_tat', [])[:3] if display_items else [],
+        'tin_ngan_han': xu_the_tin.get('tin_ngan_han', [])[:3],
+        'tin_trung_han': xu_the_tin.get('tin_trung_han', [])[:3],
     }
 
 

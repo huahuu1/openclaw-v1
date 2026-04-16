@@ -51,16 +51,28 @@ def score_market_news(limit_per_query=4, keep=8):
                 'freshness': freshness,
                 'impact_level': news_mod.impact_from_score(sc),
                 'news_type': news_mod.classify_news_type(it.get('title', '')),
+                'is_reference_like': news_mod.is_reference_headline(it.get('title', '')),
             })
-    merged.sort(key=lambda x: (x.get('freshness') == 'fresh', x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
-    total = sum(x.get('score', 0) for x in merged)
-    trend = news_mod.danh_gia_xu_the_tin(merged, total)
+    merged.sort(key=lambda x: (x.get('freshness') == 'fresh', x.get('freshness') == 'recent', x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
+    usable = [
+        x for x in merged
+        if x.get('freshness') in ('fresh', 'recent', 'aging') and not x.get('is_reference_like')
+    ]
+    display_items = [
+        x for x in usable
+        if (x.get('age_hours') is not None and x.get('age_hours') <= 7 * 24)
+    ]
+    total = sum(x.get('score', 0) for x in usable)
+    trend = news_mod.danh_gia_xu_the_tin(usable, total)
     return {
         'query_set': MARKET_NEWS_QUERIES,
         'news_score': total,
         'verdict': 'positive' if total >= 5 else 'negative' if total <= -5 else 'neutral',
-        'items': merged[:keep],
+        'items': display_items[:keep],
+        'news_quality_flag': 'fresh_or_recent' if any(x.get('freshness') in ('fresh', 'recent') for x in usable) else 'aging_only' if usable else 'no_usable_news',
         **trend,
+        'tin_ngan_han': trend.get('tin_ngan_han', [])[:3],
+        'tin_trung_han': trend.get('tin_trung_han', [])[:3],
     }
 
 
@@ -127,7 +139,7 @@ def compact_news_lines(news_payload, topn=3):
 def has_usable_news(news_payload):
     if not news_payload:
         return False
-    return bool(news_payload.get('tin_tom_tat') or news_payload.get('items'))
+    return bool(news_payload.get('tin_tom_tat'))
 
 
 def main():
@@ -199,6 +211,9 @@ def main():
             'technical': item,
             'news': news,
             'nguon_doc_nhanh': news_lines,
+            'catalyst_flag': news.get('catalyst_flag', 'thieu_catalyst_moi'),
+            'news_score_short_term': news.get('news_score_short_term', 0),
+            'news_score_medium_term': news.get('news_score_medium_term', 0),
         })
 
     print(json.dumps(out, ensure_ascii=False))

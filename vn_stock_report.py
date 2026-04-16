@@ -40,6 +40,9 @@ BAN_DO_NHAN = {
     'recent': 'Gần đây',
     'stale': 'Cũ',
     'delayed': 'Trễ dữ liệu',
+    'co_catalyst_moi': 'Có catalyst mới',
+    'chi_co_tin_trung_han': 'Chỉ có tin trung hạn',
+    'thieu_catalyst_moi': 'Thiếu catalyst mới',
 }
 
 BAN_DO_LY_DO = {
@@ -228,6 +231,46 @@ def lam_dep_nguon_tin(ds_nguon_tin):
     return ket_qua
 
 
+def xay_nguon_tin_uu_tien(news_payload):
+    uu_tien = []
+    seen = set()
+
+    def add_items(items, label=None):
+        for item in items or []:
+            link = item.get('duong_dan') or item.get('link') or item.get('duong_dan_goc') or ''
+            title = item.get('tieu_de') or item.get('summary') or item.get('title') or 'Tin tham khảo'
+            key = (title.strip().lower(), link.strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            uu_tien.append({
+                'tieu_de': title,
+                'nguon': item.get('nguon') or item.get('source') or item.get('nguon_hien_thi') or 'Nguồn chưa rõ',
+                'duong_dan': link,
+                'gio_dang': item.get('gio_dang') or item.get('pubDate'),
+                'so_gio_truoc': item.get('so_gio_truoc') if item.get('so_gio_truoc') is not None else item.get('age_hours'),
+                'nhom_tin': label,
+            })
+
+    add_items(news_payload.get('tin_ngan_han', []), 'ngắn hạn')
+    add_items(news_payload.get('tin_trung_han', []), 'trung hạn')
+
+    if not uu_tien:
+        fallback = []
+        for z in news_payload.get('items', [])[:3]:
+            fallback.append({
+                'tieu_de': z.get('summary') or z.get('title'),
+                'nguon': z.get('source') or z.get('nguon_hien_thi'),
+                'duong_dan': z.get('link') or z.get('duong_dan_goc'),
+                'gio_dang': z.get('pubDate'),
+                'so_gio_truoc': z.get('age_hours'),
+                'nhom_tin': 'fallback',
+            })
+        add_items(fallback, 'fallback')
+
+    return uu_tien[:3]
+
+
 def tinh_quan_tri_von(tai_khoan, rui_ro_phan_tram, gia_vao, moc_sai, ti_le_toi_da_vao_lenh, he_so_vuot=1.0):
     if not tai_khoan or gia_vao <= 0 or moc_sai <= 0 or gia_vao <= moc_sai:
         return None
@@ -317,7 +360,7 @@ def xay_dung_ke_hoach(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_va
     ly_do = []
     if row.get('score', 0) >= 9:
         ly_do.append('technical_score_strong')
-    if row.get('news_verdict') == 'positive':
+    if row.get('catalyst_flag') == 'co_catalyst_moi' or row.get('news_verdict') == 'positive':
         ly_do.append('news_supportive')
     if row.get('h1_trend_ok'):
         ly_do.append('h1_confirmed')
@@ -419,6 +462,15 @@ def viet_hoa_mot_dong(row, tai_khoan=None, rui_ro_phan_tram=1.0, ti_le_toi_da_va
         'tac_dong_tin_trung_han': row.get('news_impact_medium'),
         'ket_luan_xu_the_tin': row.get('news_trend_view'),
         'do_tin_cay_xu_the_tin': row.get('news_trend_confidence'),
+        'chat_luong_tin_tuc': row.get('news_quality_flag'),
+        'co_catalyst': BAN_DO_NHAN.get(row.get('catalyst_flag'), row.get('catalyst_flag')),
+        'catalyst_flag': row.get('catalyst_flag'),
+        'diem_tin_ngan_han': row.get('news_score_short_term'),
+        'diem_tin_trung_han': row.get('news_score_medium_term'),
+        'so_luong_tin_ngan_han': row.get('news_short_term_count'),
+        'so_luong_tin_trung_han': row.get('news_medium_term_count'),
+        'tin_ngan_han': row.get('news_short_term_items', []),
+        'tin_trung_han': row.get('news_medium_term_items', []),
         'dong_tien': dong_tien,
         'du_lieu_thoi_gian': {
             'daily_iso': data_timestamps.get('daily_iso'),
@@ -495,21 +547,19 @@ def tron_du_lieu(scan_payload, news_payload, mode='balanced'):
             'news_verdict': n['verdict'],
             'top_news': [z['title'] for z in n.get('items', [])[:3]],
             'news_summary_items': n.get('tin_tom_tat', []),
-            'news_source_links': [
-                {
-                    'tieu_de': z.get('summary') or z.get('title'),
-                    'nguon': z.get('source') or z.get('nguon_hien_thi'),
-                    'duong_dan': z.get('link') or z.get('duong_dan_goc'),
-                    'gio_dang': z.get('pubDate'),
-                    'so_gio_truoc': z.get('age_hours'),
-                }
-                for z in n.get('items', [])[:3]
-                if z.get('link') or z.get('duong_dan_goc')
-            ],
+            'news_source_links': xay_nguon_tin_uu_tien(n),
             'news_impact_short': n.get('tac_dong_ngan_han'),
             'news_impact_medium': n.get('tac_dong_trung_han'),
             'news_trend_view': n.get('ket_luan_xu_the_tin'),
             'news_trend_confidence': n.get('do_tin_cay_xu_the_tin'),
+            'news_quality_flag': n.get('news_quality_flag'),
+            'catalyst_flag': n.get('catalyst_flag'),
+            'news_score_short_term': n.get('news_score_short_term', 0),
+            'news_score_medium_term': n.get('news_score_medium_term', 0),
+            'news_short_term_count': n.get('short_term_count', 0),
+            'news_medium_term_count': n.get('medium_term_count', 0),
+            'news_short_term_items': n.get('tin_ngan_han', []),
+            'news_medium_term_items': n.get('tin_trung_han', []),
             'diem_nganh_dan_song': diem_nganh_dan_song,
             'la_nhom_dan_song': la_nhom_dan_song,
             'final_score': final_score,

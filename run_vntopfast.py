@@ -88,6 +88,17 @@ def news_lines(item, n=3):
     return lines[:n]
 
 
+def catalyst_text(item):
+    flag = item.get('catalyst_flag') or 'thieu_catalyst_moi'
+    short_score = item.get('news_score_short_term', 0)
+    medium_score = item.get('news_score_medium_term', 0)
+    if flag == 'co_catalyst_moi':
+        return f'Có catalyst mới, nghiêng ngắn hạn tốt hơn (short={short_score}, medium={medium_score}).'
+    if flag == 'chi_co_tin_trung_han':
+        return f'Chủ yếu còn câu chuyện trung hạn, thiếu catalyst mới cho T+ gần (short={short_score}, medium={medium_score}).'
+    return f'Thiếu catalyst mới rõ ràng, không nên dựa vào news để đẩy kỳ vọng ngắn hạn (short={short_score}, medium={medium_score}).'
+
+
 def section_lines(title, items):
     out = [f'## {title}']
     if not items:
@@ -101,6 +112,7 @@ def section_lines(title, items):
         out.append(f'### {symbol}')
         out.append(f'- Nhận định ngắn: {nhan_dinh_ngan(item)}')
         out.append(f'- Hành động: {hanh_dong(item)}')
+        out.append(f'- Catalyst/tin tức: {catalyst_text(item)}')
         out.append('- Vùng mua / không mua đuổi / dừng lỗ / chốt lời:')
         out.append(f'  - Vùng mua: {price_band(lv["buy_low"], lv["buy_high"])}')
         out.append(f'  - Không mua đuổi: trên {fmt_price(lv["no_chase"])}')
@@ -144,6 +156,13 @@ def main():
     if leaders:
         lines.append(f'- Nhóm dẫn dắt: **{leaders}**')
     lines.append('- Tin chung thị trường:')
+    market_flag = market_news.get('catalyst_flag') or 'thieu_catalyst_moi'
+    if market_flag == 'co_catalyst_moi':
+        lines.append('  - Trạng thái catalyst thị trường: có tin mới đáng chú ý.')
+    elif market_flag == 'chi_co_tin_trung_han':
+        lines.append('  - Trạng thái catalyst thị trường: chủ yếu là tin trung hạn/câu chuyện cũ.')
+    else:
+        lines.append('  - Trạng thái catalyst thị trường: chưa có tin mới đủ mạnh.')
     market_news_lines = []
     for it in (market_news.get('tin_tom_tat') or [])[:3]:
         title = it.get('tieu_de') or it.get('tom_tat') or ''
