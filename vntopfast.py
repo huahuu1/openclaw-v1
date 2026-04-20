@@ -2,9 +2,22 @@ import argparse
 import json
 import subprocess
 import sys
+import os
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-ROOT = Path('/home/node/.openclaw/workspace')
+# Load .env from the same directory as this script
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ENV_FILE = _SCRIPT_DIR / '.env'
+if _ENV_FILE.exists():
+    with open(_ENV_FILE) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith('#') and '=' in _line:
+                _key, _val = _line.split('=', 1)
+                os.environ.setdefault(_key.strip(), _val.strip())
+
+ROOT = Path(os.environ.get('VNTOP_ROOT', '/home/node/.openclaw/workspace'))
 SCAN = ROOT / 'vn_stock_scan.py'
 NEWS = ROOT / 'vn_stock_news.py'
 
@@ -224,6 +237,229 @@ def has_usable_news(news_payload):
     return bool(news_payload.get('tin_tom_tat'))
 
 
+def _fmt(x, decimals=2):
+    if x is None:
+        return 'n/a'
+    if isinstance(x, float):
+        return f'{x:.{decimals}f}'.rstrip('0').rstrip('.')
+    return str(x)
+
+
+def _sign(x):
+    if x is None:
+        return 'n/a'
+    prefix = '+' if x > 0 else ''
+    return f'{prefix}{_fmt(x)}%'
+
+
+def format_markdown(out):
+    """Convert the scan output dict into a readable Vietnamese markdown report."""
+    vn_tz = timezone(timedelta(hours=7))
+    ts = out.get('ts')
+    time_str = datetime.fromtimestamp(ts, tz=vn_tz).strftime('%H:%M %d/%m/%Y') if ts else 'n/a'
+
+    lines = []
+    lines.append(f'# 📊 VNTop Scan Report')
+    lines.append(f'> Cập nhật: **{time_str}** | Mode: `{out.get("scan_mode", "broad")}` | Breadth: `{out.get("breadth_mode", "broad")}`')
+    lines.append('')
+
+    # --- Market context ---
+    mc = out.get('market_context') or {}
+    regime = mc.get('regime', 'n/a')
+    regime_emoji = {'risk_on': '🟢', 'risk_off': '🔴', 'mixed': '🟡'}.get(regime, '⚪')
+    lines.append('## 🌐 Bối cảnh thị trường')
+    lines.append(f'- Trạng thái: {regime_emoji} **{regime.upper()}** — {mc.get("regime_text", "")}')
+
+    be = out.get('breadth_extended') or {}
+    lines.append(f'- Độ rộng: tăng **{be.get("advance", "?")}** / giảm **{be.get("decline", "?")}** / đứng **{be.get("flat", "?")}** ({be.get("valid_count", "?")} mã)')
+    lines.append(f'- Trên EMA20: **{_fmt(mc.get("above_ema20_ratio"))}** | Volume mạnh: **{_fmt(mc.get("strong_volume_ratio"))}** | Advance ratio: **{_fmt(mc.get("advance_ratio"))}**')
+
+    leaders = ', '.join(mc.get('leading_sectors') or [])
+    if leaders:
+        lines.append(f'- Nhóm dẫn dắt: **{leaders}**')
+    lines.append('')
+
+    # --- Market news ---
+    mn = out.get('market_news') or {}
+    mn_items = mn.get('items') or []
+    if mn_items:
+        lines.append('## 📰 Tin thị trường')
+        verdict_emoji = {'positive': '🟢', 'negative': '🔴', 'neutral': '🟡'}.get(mn.get('verdict'), '⚪')
+        lines.append(f'> {verdict_emoji} News score: **{mn.get("news_score", 0)}** | Verdict: **{mn.get("verdict", "neutral")}**')
+        catalyst_flag = mn.get('catalyst_flag', '')
+        if catalyst_flag == 'co_catalyst_moi':
+            lines.append('> 🔥 Có tin mới đáng chú ý cho thị trường')
+        elif catalyst_flag == 'chi_co_tin_trung_han':
+            lines.append('> 📋 Chủ yếu tin trung hạn / câu chuyện cũ')
+        lines.append('')
+        for it in mn_items[:6]:
+            age = it.get('age_hours')
+            age_str = f'`{age:.0f}h`' if isinstance(age, (int, float)) else ''
+            src = it.get('nguon_hien_thi') or it.get('source') or ''
+            title = it.get('summary') or it.get('title') or ''
+            link = it.get('duong_dan_goc') or it.get('link') or ''
+            impact = it.get('impact_level') or ''
+            impact_badge = {'high': '🔴', 'medium': '🟡', 'low': '⚪'}.get(impact, '')
+            line_parts = [f'{impact_badge} **{title}**']
+            extras = []
+            if src:
+                extras.append(f'_{src}_')
+            if age_str:
+                extras.append(age_str)
+            if extras:
+                line_parts.append(' · '.join(extras))
+            line = ' — '.join(line_parts)
+            if link:
+                line += f' [↗]({link})'
+            lines.append(f'- {line}')
+        lines.append('')
+
+    # --- Sector strength ---
+    sectors = out.get('sector_strength') or []
+    if sectors:
+        lines.append('## 🏭 Sức mạnh ngành')
+        lines.append('| Ngành | Số mã | Thay đổi 1D | Điểm TB |')
+        lines.append('|:------|:-----:|:----------:|:-------:|')
+        for s in sectors[:10]:
+            chg = s.get('avg_change_pct_1d')
+            chg_emoji = '📈' if chg and chg > 0 else '📉' if chg and chg < 0 else '➖'
+            lines.append(f'| {s.get("sector", "?")} | {s.get("count", 0)} | {chg_emoji} {_sign(chg)} | {_fmt(s.get("avg_score", 0))} |')
+        lines.append('')
+
+    # --- Symbols by tier ---
+    tier_config = [
+        ('mua_duoc_ngay', '🟢 Mua được ngay', 'Điểm kỹ thuật tốt, risk hợp lý — có thể vào vị thế thăm dò.'),
+        ('cho_dieu_chinh', '🟡 Chờ điều chỉnh', 'Cấu trúc mạnh nhưng nên chờ nhịp về hỗ trợ hoặc nền mới.'),
+        ('chi_quan_sat', '👁️ Chỉ quan sát', 'Đang theo dõi, chưa đủ điều kiện để hành động.'),
+    ]
+
+    symbols_data = {item.get('symbol'): item for item in out.get('symbols', [])}
+
+    for tier_key, tier_title, tier_desc in tier_config:
+        tier_symbols_list = out.get('tiers', {}).get(tier_key, [])
+        lines.append(f'## {tier_title}')
+        lines.append(f'> {tier_desc}')
+        lines.append('')
+
+        if not tier_symbols_list:
+            lines.append('_Chưa có mã phù hợp trong nhóm này._')
+            lines.append('')
+            continue
+
+        for symbol in tier_symbols_list:
+            sym_data = symbols_data.get(symbol)
+            if not sym_data:
+                lines.append(f'### {symbol}')
+                lines.append('_Không có dữ liệu chi tiết._')
+                lines.append('')
+                continue
+
+            t = sym_data.get('technical') or {}
+            lv = build_levels(t)
+
+            # Header with verdict badge
+            verdict = t.get('verdict', '?')
+            verdict_badge = {'PROPOSE': '🟢', 'WATCH': '🟡', 'PASS': '⚪'}.get(verdict, '⚪')
+            lines.append(f'### {verdict_badge} {symbol} — Score **{t.get("score", 0)}** | {verdict}')
+            lines.append('')
+
+            # Nhận định + Hành động
+            lines.append(f'> 💡 {nhan_dinh_ngan(sym_data)}')
+            lines.append(f'> 🎯 {hanh_dong(sym_data)}')
+            lines.append('')
+
+            # Buy / Stop / TP levels
+            lines.append('**Vùng giá hành động:**')
+            lines.append('')
+            lines.append(f'| | Giá |')
+            lines.append(f'|:---|:---:|')
+            lines.append(f'| 🟢 Vùng mua | **{fmt_price(lv["buy_low"])}** – **{fmt_price(lv["buy_high"])}** |')
+            lines.append(f'| 🚫 Không đuổi | > {fmt_price(lv["no_chase"])} |')
+            lines.append(f'| 🔴 Dừng lỗ | {fmt_price(lv["stop"])} |')
+            lines.append(f'| 🎯 Chốt lời | {fmt_price(lv["tp1"])} – {fmt_price(lv["tp2"])} |')
+            lines.append('')
+
+            # Technical details
+            lines.append('<details>')
+            lines.append(f'<summary>📊 Chi tiết kỹ thuật {symbol}</summary>')
+            lines.append('')
+            lines.append('| Chỉ số | Giá trị |')
+            lines.append('|:-------|:--------|')
+            lines.append(f'| Close | **{_fmt(t.get("close"))}** |')
+            lines.append(f'| Thay đổi 1D / 5D / 20D | {_sign(t.get("change_pct_1d"))} / {_sign(t.get("change_pct_5d"))} / {_sign(t.get("change_pct_20d"))} |')
+            lines.append(f'| RSI(14) | {_fmt(t.get("rsi14"))} |')
+            lines.append(f'| Rel Volume | {_fmt(t.get("rel_volume20"))} |')
+            lines.append(f'| EMA 20 / 50 / 200 | {_fmt(t.get("ema20"))} / {_fmt(t.get("ema50"))} / {_fmt(t.get("ema200"))} |')
+            lines.append(f'| Range 20D | {_fmt(t.get("low20"))} – {_fmt(t.get("high20"))} |')
+            lines.append(f'| Stop ref | {_fmt(t.get("stop_ref"))} (risk {_fmt(t.get("risk_pct_to_stop"))}%) |')
+            lines.append(f'| ATR(14) | {_fmt(t.get("atr14"))} |')
+            sb = t.get('score_breakdown', {})
+            lines.append(f'| Score | **{t.get("score", 0)}** = trend({sb.get("trend_score", 0)}) + qual({sb.get("quality_score", 0)}) + mom({sb.get("momentum_score", 0)}) + risk({sb.get("risk_score", 0)}) + trig({sb.get("trigger_score", 0)}) − pen({sb.get("penalty", 0)}) |')
+            h1_ok = '✅' if t.get('h1_trend_ok') else '❌'
+            m15_ok = '✅' if t.get('m15_trigger_ok') else '❌'
+            lines.append(f'| H1 trend / M15 trigger | {h1_ok} / {m15_ok} |')
+
+            notes = t.get('notes') or []
+            if notes:
+                lines.append(f'| Notes | `{", ".join(notes)}` |')
+
+            warnings = t.get('data_quality_warnings') or []
+            if warnings:
+                lines.append(f'| ⚠️ Cảnh báo | `{", ".join(warnings)}` |')
+
+            lines.append('')
+            lines.append('</details>')
+            lines.append('')
+
+            # Catalyst
+            cat_flag = sym_data.get('catalyst_flag', 'thieu_catalyst_moi')
+            cat_emoji = {'co_catalyst_moi': '🔥', 'chi_co_tin_trung_han': '📋'}.get(cat_flag, '⚪')
+            lines.append(f'{cat_emoji} **Catalyst:** {catalyst_text(sym_data)}')
+            lines.append('')
+
+            # News
+            news_lines_data = sym_data.get('nguon_doc_nhanh') or []
+            if news_lines_data:
+                lines.append('**📰 Tin liên quan:**')
+                for nl in news_lines_data[:3]:
+                    lines.append(f'- {nl}')
+            else:
+                lines.append('_Chưa có tin đủ chất lượng._')
+            lines.append('')
+            lines.append('---')
+            lines.append('')
+
+    # --- Chốt nhanh ---
+    tier_map = {'mua_duoc_ngay': [], 'cho_dieu_chinh': [], 'chi_quan_sat': []}
+    for item in out.get('symbols', []):
+        tier_map.setdefault(item.get('tier'), []).append(item)
+
+    uu_tien = [x.get('symbol') for x in tier_map.get('mua_duoc_ngay', [])[:3]]
+    if not uu_tien:
+        uu_tien = [x.get('symbol') for x in tier_map.get('cho_dieu_chinh', [])[:3]]
+
+    lines.append('## ⚡ Chốt nhanh')
+    if uu_tien:
+        lines.append(f'- 🎯 Mã ưu tiên theo dõi: **{", ".join(uu_tien)}**')
+    else:
+        lines.append('- Chưa có mã nào đủ đẹp để ưu tiên mạnh tay.')
+    lines.append('- Ưu tiên chọn mã có volume tốt, risk về stop thấp và chưa bị extended.')
+    lines.append('')
+
+    # --- Errors ---
+    errs = out.get('errors') or []
+    if errs:
+        lines.append('## ⚠️ Lỗi')
+        for e in errs[:10]:
+            lines.append(f'- `{e.get("symbol", "?")}`: {e.get("error", "unknown")}')
+        lines.append('')
+
+    # --- Footer ---
+    lines.append('---')
+    lines.append(f'_Generated at {time_str} by vntopfast.py_')
+
+    return '\n'.join(lines)
+
 def render_text_report(payload):
     market = payload.get('market_context', {})
     market_news = payload.get('market_news', {})
@@ -384,6 +620,13 @@ def main():
         print(json.dumps(out, ensure_ascii=False))
     else:
         print(render_text_report(out))
+
+    # Write markdown report to fixed file
+    md_path = _SCRIPT_DIR / 'vntop_report.md'
+    md_content = format_markdown(out)
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write(md_content)
+    print(f'\n📄 Report saved: {md_path}', file=sys.stderr)
 
 
 if __name__ == '__main__':

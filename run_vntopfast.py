@@ -1,9 +1,21 @@
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 
-ROOT = Path('/home/node/.openclaw/workspace')
+# Load .env from the same directory as this script
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ENV_FILE = _SCRIPT_DIR / '.env'
+if _ENV_FILE.exists():
+    with open(_ENV_FILE) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith('#') and '=' in _line:
+                _key, _val = _line.split('=', 1)
+                os.environ.setdefault(_key.strip(), _val.strip())
+
+ROOT = Path(os.environ.get('VNTOP_ROOT', '/home/node/.openclaw/workspace'))
 FAST = ROOT / 'vntopfast.py'
 
 
@@ -139,59 +151,9 @@ def main():
     cmd = ['python3', str(FAST), '--mode', args.mode, '--top', str(args.top), '--watch-top', str(args.watch_top)]
     if args.symbols:
         cmd.extend(args.symbols)
-    payload = run_json(cmd)
 
-    market = payload.get('market_context', {})
-    market_news = payload.get('market_news', {})
-    tier_map = {'mua_duoc_ngay': [], 'cho_dieu_chinh': [], 'chi_quan_sat': []}
-    for item in payload.get('symbols', []):
-        tier_map.setdefault(item.get('tier'), []).append(item)
-
-    lines = []
-    lines.append('**Bối cảnh thị trường**')
-    lines.append(f"- Trạng thái: **{market.get('regime', 'n/a')}** — {market.get('regime_text', '')}")
-    lines.append(f"- Độ rộng: tăng/giảm = **{payload.get('breadth_extended', {}).get('advance', 'n/a')} / {payload.get('breadth_extended', {}).get('decline', 'n/a')}**, advance ratio **{market.get('advance_ratio', 'n/a')}**")
-    lines.append(f"- Trên EMA20: **{market.get('above_ema20_ratio', 'n/a')}** | Volume mạnh: **{market.get('strong_volume_ratio', 'n/a')}**")
-    leaders = ', '.join(market.get('leading_sectors', []) or [])
-    if leaders:
-        lines.append(f'- Nhóm dẫn dắt: **{leaders}**')
-    lines.append('- Tin chung thị trường:')
-    market_flag = market_news.get('catalyst_flag') or 'thieu_catalyst_moi'
-    if market_flag == 'co_catalyst_moi':
-        lines.append('  - Trạng thái catalyst thị trường: có tin mới đáng chú ý.')
-    elif market_flag == 'chi_co_tin_trung_han':
-        lines.append('  - Trạng thái catalyst thị trường: chủ yếu là tin trung hạn/câu chuyện cũ.')
-    else:
-        lines.append('  - Trạng thái catalyst thị trường: chưa có tin mới đủ mạnh.')
-    market_news_lines = []
-    for it in (market_news.get('tin_tom_tat') or [])[:3]:
-        title = it.get('tieu_de') or it.get('tom_tat') or ''
-        source = it.get('nguon') or ''
-        hours = it.get('so_gio_truoc')
-        hours_text = f'{hours:.1f}h' if isinstance(hours, (int, float)) else 'n/a'
-        link = it.get('duong_dan') or ''
-        market_news_lines.append(f'  - {title} | {source} | {hours_text} | {link}')
-    if market_news_lines:
-        lines.extend(market_news_lines)
-    else:
-        lines.append('  - Chưa lấy được block tin chung thị trường.')
-    lines.append('')
-
-    lines.extend(section_lines('Mua được ngay', tier_map.get('mua_duoc_ngay', [])))
-    lines.extend(section_lines('Chờ điều chỉnh', tier_map.get('cho_dieu_chinh', [])))
-    lines.extend(section_lines('Chỉ quan sát nhưng đang mạnh', tier_map.get('chi_quan_sat', [])))
-
-    uu_tien = [x.get('symbol') for x in tier_map.get('mua_duoc_ngay', [])[:3]]
-    if not uu_tien:
-        uu_tien = [x.get('symbol') for x in tier_map.get('cho_dieu_chinh', [])[:3]]
-    lines.append('## Chốt nhanh')
-    if uu_tien:
-        lines.append(f"- Mã nên ưu tiên theo dõi lúc này: **{', '.join(uu_tien)}**")
-    else:
-        lines.append('- Chưa có mã nào đủ đẹp để ưu tiên mạnh tay.')
-    lines.append('- Nếu thị trường tiếp tục giữ breadth tốt, ưu tiên chọn mã có volume tốt, risk về stop thấp và chưa bị extended.')
-
-    print('\n'.join(lines))
+    result = subprocess.run(cmd, text=True)
+    raise SystemExit(result.returncode)
 
 
 if __name__ == '__main__':

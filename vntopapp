@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# python3 /Users/huuht/Documents/openclaw-v1/vn_stock_scan.py --mode broad --top 12 --compact "$@"
+
+python3 /Users/huuht/Documents/openclaw-v1/run_vntopfast.py "$@"
