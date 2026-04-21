@@ -29,8 +29,8 @@ MARKET_NEWS_QUERIES = [
 
 
 def run_json(cmd):
-    out = subprocess.check_output(cmd, text=True)
-    return json.loads(out)
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=True)
+    return json.loads(proc.stdout)
 
 
 def fmt_price(x):
@@ -95,12 +95,18 @@ def hanh_dong(item):
     tier = item.get('tier')
     t = item.get('technical', {})
     notes = set(t.get('notes', []))
+    setup_quality = item.get('setup_quality', 'trung_binh')
     if tier == 'mua_duoc_ngay':
-        if 'm15_not_confirmed' in notes:
+        if item.get('intraday_freshness') != 'fresh':
+            return 'Setup ổn nhưng intraday chưa thật sự tươi; chỉ nên thăm dò nhỏ và chờ xác nhận thêm.'
+        if 'm15_not_confirmed' in notes or setup_quality == 'nong':
             return 'Có thể mua, nhưng ưu tiên canh nhịp thay vì đuổi ngay.'
         return 'Có thể mua theo vị thế thăm dò hoặc gom khi giữ nền.'
     if tier == 'cho_dieu_chinh':
         return 'Ưu tiên chờ nhịp điều chỉnh hoặc nền mới, không mua đuổi.'
+    trigger = item.get('upgrade_trigger')
+    if trigger:
+        return f'Quan sát thêm; chỉ nâng hạng khi {trigger}.'
     return 'Quan sát thêm, chỉ nâng hạng nếu tín hiệu ngắn hạn xác nhận rõ hơn.'
 
 
@@ -112,7 +118,7 @@ def catalyst_text(item):
         return f'Có catalyst mới, nghiêng ngắn hạn tốt hơn (short={short_score}, medium={medium_score}).'
     if flag == 'chi_co_tin_trung_han':
         return f'Chủ yếu còn câu chuyện trung hạn, thiếu catalyst mới cho T+ gần (short={short_score}, medium={medium_score}).'
-    return f'Thiếu catalyst mới rõ ràng, không nên dựa vào news để đẩy kỳ vọng ngắn hạn (short={short_score}, medium={medium_score}).'
+    return f'Thiếu catalyst mới rõ ràng; các headline kiểu kể biến động giá không được tính là catalyst mạnh (short={short_score}, medium={medium_score}).'
 
 
 def score_market_news(limit_per_query=4, keep=8):
@@ -134,24 +140,30 @@ def score_market_news(limit_per_query=4, keep=8):
                 (it.get('link', '') + ' ' + it.get('source', '')),
                 age,
             )
+            title = it.get('title', '')
+            news_type = news_mod.classify_news_type(title)
             merged.append({
                 **it,
                 'age_hours': round(age, 1) if age is not None else None,
                 'score': sc,
                 'hits': hits,
-                'summary': news_mod.tom_tat_tieu_de(it.get('title', '')),
+                'summary': news_mod.tom_tat_tieu_de(title),
                 'nguon_hien_thi': it.get('source') or '',
                 'duong_dan_goc': it.get('link') or '',
                 'diem_uu_tien_nguon': news_mod.diem_uu_tien_nguon(it.get('source')),
                 'freshness': freshness,
                 'impact_level': news_mod.impact_from_score(sc),
-                'news_type': news_mod.classify_news_type(it.get('title', '')),
-                'is_reference_like': news_mod.is_reference_headline(it.get('title', '')),
+                'news_type': news_type,
+                'is_reference_like': news_mod.is_reference_headline(title),
+                'is_price_action_only': news_mod.is_price_action_only_headline(title),
             })
     merged.sort(key=lambda x: (x.get('freshness') == 'fresh', x.get('freshness') == 'recent', x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
     usable = [
         x for x in merged
-        if x.get('freshness') in ('fresh', 'recent', 'aging') and not x.get('is_reference_like')
+        if x.get('freshness') in ('fresh', 'recent', 'aging')
+        and not x.get('is_reference_like')
+        and not x.get('is_price_action_only')
+        and x.get('news_type') == 'tin vĩ mô/thị trường'
     ]
     display_items = [
         x for x in usable
@@ -193,24 +205,107 @@ def pick_symbols(scan_payload, top, watch_limit=None):
     return picked
 
 
+def infer_intraday_freshness(item):
+    warnings = set(item.get('data_quality_warnings') or [])
+    if 'intraday_data_not_fresh' in warnings:
+        return 'stale'
+    return 'fresh'
+
+
+def setup_quality_label(item):
+    notes = set(item.get('notes', []))
+    relv = item.get('rel_volume20') or 0
+    risk = item.get('risk_pct_to_stop') or 999
+    if 'extended' in notes or 'near_20d_breakout' in notes:
+        return 'nong'
+    if relv >= 1.2 and risk <= 3.8 and 'm15_not_confirmed' not in notes:
+        return 'sach'
+    return 'trung_binh'
+
+
+def upgrade_trigger(item):
+    close = item.get('close') or 0
+    high20 = item.get('high20') or close
+    ema20 = item.get('ema20') or close
+    stop_ref = item.get('stop_ref') or close
+    notes = set(item.get('notes', []))
+    if 'm15_not_confirmed' in notes or 'h1_not_confirmed' in notes:
+        return f'vượt lại {fmt_price(high20)} với intraday xác nhận và volume giữ tốt'
+    if 'extended' in notes:
+        return f'lùi về quanh {price_band(max(stop_ref, ema20), close)} rồi giữ nền ổn'
+    return f'giữ trên vùng {price_band(max(stop_ref, ema20), close)} và xuất hiện trigger intraday rõ hơn'
+
+
+def rank_bonus(item):
+    bonus = 0.0
+    notes = set(item.get('notes', []))
+    symbol = (item.get('symbol') or '').upper()
+    relv = item.get('rel_volume20') or 0
+    risk = item.get('risk_pct_to_stop') or 999
+    if item.get('intraday_freshness') == 'fresh':
+        bonus += 1.0
+    else:
+        bonus -= 1.0
+    if item.get('setup_quality') == 'sach':
+        bonus += 1.5
+    elif item.get('setup_quality') == 'nong':
+        bonus -= 1.0
+    catalyst_flag = item.get('catalyst_flag')
+    if catalyst_flag == 'co_catalyst_moi':
+        bonus += 1.0
+    elif catalyst_flag == 'thieu_catalyst_moi':
+        bonus -= 0.5
+    if relv >= 1.5:
+        bonus += 0.5
+    elif relv < 0.9:
+        bonus -= 0.5
+    if risk <= 3.0:
+        bonus += 0.5
+    elif risk > 5.0:
+        bonus -= 0.75
+    if 'h1_not_confirmed' in notes:
+        bonus -= 0.6
+    if 'm15_not_confirmed' in notes:
+        bonus -= 0.8
+    if 'extended' in notes:
+        bonus -= 0.8
+    if symbol in {'HNG', 'ITA', 'BCG'}:
+        bonus -= 0.6
+    return bonus
+
+
 def tier_symbols(scan_payload):
     buy_now = []
     wait_pullback = []
     observe_only = []
 
-    for item in scan_payload.get('proposals', []):
+    for raw in scan_payload.get('proposals', []):
+        item = dict(raw)
         notes = set(item.get('notes', []))
         risk = item.get('risk_pct_to_stop') or 999
         score = item.get('score', 0)
-        if 'extended' in notes or 'avoid_chasing' in notes or 'near_20d_breakout' in notes or risk > 4.0:
+        item['intraday_freshness'] = infer_intraday_freshness(item)
+        item['setup_quality'] = setup_quality_label(item)
+        item['upgrade_trigger'] = upgrade_trigger(item)
+        if item['intraday_freshness'] != 'fresh':
             wait_pullback.append(item)
-        elif score >= 12 and risk <= 3.8:
+        elif 'extended' in notes or 'avoid_chasing' in notes or 'near_20d_breakout' in notes or risk > 4.0:
+            wait_pullback.append(item)
+        elif score >= 12 and risk <= 3.8 and item['setup_quality'] == 'sach':
             buy_now.append(item)
         else:
             wait_pullback.append(item)
 
-    for item in scan_payload.get('watch', []):
+    for raw in scan_payload.get('watch', []):
+        item = dict(raw)
+        item['intraday_freshness'] = infer_intraday_freshness(item)
+        item['setup_quality'] = setup_quality_label(item)
+        item['upgrade_trigger'] = upgrade_trigger(item)
         observe_only.append(item)
+
+    buy_now.sort(key=lambda x: (x.get('score', 0) + rank_bonus(x), x.get('rel_volume20', 0)), reverse=True)
+    wait_pullback.sort(key=lambda x: (x.get('score', 0) + rank_bonus(x), x.get('rel_volume20', 0)), reverse=True)
+    observe_only.sort(key=lambda x: (x.get('score', 0) + rank_bonus(x), x.get('rel_volume20', 0)), reverse=True)
 
     return {
         'mua_duoc_ngay': buy_now,
@@ -221,7 +316,13 @@ def tier_symbols(scan_payload):
 
 def compact_news_lines(news_payload, topn=3):
     lines = []
-    for it in (news_payload or {}).get('tin_tom_tat', [])[:topn]:
+    kept = []
+    for it in (news_payload or {}).get('tin_tom_tat', []):
+        hours = it.get('so_gio_truoc')
+        if isinstance(hours, (int, float)) and hours > 72:
+            continue
+        kept.append(it)
+    for it in kept[:topn]:
         title = it.get('tieu_de') or it.get('tom_tat') or ''
         source = it.get('nguon') or ''
         hours = it.get('so_gio_truoc')
@@ -229,6 +330,41 @@ def compact_news_lines(news_payload, topn=3):
         link = it.get('duong_dan') or ''
         lines.append(f"{title} | {source} | {hours_text} | {link}")
     return lines
+
+
+def top_clean_setups(symbols, limit=3):
+    scored = []
+    for item in symbols:
+        if item.get('tier') == 'chi_quan_sat':
+            continue
+        tech = item.get('technical', {})
+        score = item.get('setup_rank_score', 0)
+        if item.get('intraday_freshness') != 'fresh':
+            score -= 1.0
+        if item.get('setup_quality') == 'sach':
+            score += 1.0
+        if item.get('catalyst_flag') == 'co_catalyst_moi':
+            score += 0.7
+        if item.get('catalyst_flag') == 'thieu_catalyst_moi':
+            score -= 0.4
+        if (tech.get('rel_volume20') or 0) < 0.9:
+            score -= 0.5
+        scored.append((score, item))
+    scored.sort(key=lambda x: (x[0], x[1].get('technical', {}).get('rel_volume20', 0)), reverse=True)
+    return [item for _, item in scored[:limit]]
+
+
+def format_error_message(err):
+    symbol = err.get('symbol', '?')
+    raw = err.get('error', 'unknown')
+    text = str(raw).lower()
+    if 'not enough bars' in text or 'not enough daily bars' in text:
+        msg = 'thiếu dữ liệu giá để chấm điểm ổn định'
+    elif '400' in text or 'bad request' in text:
+        msg = 'lỗi truy vấn dữ liệu hoặc symbol không hợp lệ'
+    else:
+        msg = raw
+    return f'`{symbol}`: {msg}'
 
 
 def has_usable_news(news_payload):
@@ -318,12 +454,14 @@ def format_markdown(out):
     sectors = out.get('sector_strength') or []
     if sectors:
         lines.append('## 🏭 Sức mạnh ngành')
-        lines.append('| Ngành | Số mã | Thay đổi 1D | Điểm TB |')
-        lines.append('|:------|:-----:|:----------:|:-------:|')
+        lines.append('| Ngành | Số mã | Thay đổi 1D | Điểm TB | Tin cậy |')
+        lines.append('|:------|:-----:|:----------:|:-------:|:------:|')
         for s in sectors[:10]:
             chg = s.get('avg_change_pct_1d')
             chg_emoji = '📈' if chg and chg > 0 else '📉' if chg and chg < 0 else '➖'
-            lines.append(f'| {s.get("sector", "?")} | {s.get("count", 0)} | {chg_emoji} {_sign(chg)} | {_fmt(s.get("avg_score", 0))} |')
+            count = s.get('count', 0)
+            confidence = 'high' if count >= 5 else 'medium' if count >= 3 else 'low'
+            lines.append(f'| {s.get("sector", "?")} | {count} | {chg_emoji} {_sign(chg)} | {_fmt(s.get("avg_score", 0))} | {confidence} |')
         lines.append('')
 
     # --- Symbols by tier ---
@@ -366,6 +504,7 @@ def format_markdown(out):
             # Nhận định + Hành động
             lines.append(f'> 💡 {nhan_dinh_ngan(sym_data)}')
             lines.append(f'> 🎯 {hanh_dong(sym_data)}')
+            lines.append(f'> 📈 Execution confidence: **{sym_data.get("execution_confidence", "vừa")}**')
             lines.append('')
 
             # Buy / Stop / TP levels
@@ -415,6 +554,8 @@ def format_markdown(out):
             cat_flag = sym_data.get('catalyst_flag', 'thieu_catalyst_moi')
             cat_emoji = {'co_catalyst_moi': '🔥', 'chi_co_tin_trung_han': '📋'}.get(cat_flag, '⚪')
             lines.append(f'{cat_emoji} **Catalyst:** {catalyst_text(sym_data)}')
+            if sym_data.get('tier') == 'chi_quan_sat' and sym_data.get('upgrade_trigger'):
+                lines.append(f'📌 **Nâng hạng nếu:** {sym_data.get("upgrade_trigger")}')
             lines.append('')
 
             # News
@@ -443,6 +584,9 @@ def format_markdown(out):
         lines.append(f'- 🎯 Mã ưu tiên theo dõi: **{", ".join(uu_tien)}**')
     else:
         lines.append('- Chưa có mã nào đủ đẹp để ưu tiên mạnh tay.')
+    clean = top_clean_setups(out.get('symbols', []), limit=3)
+    if clean:
+        lines.append(f'- 🧼 Top setup sạch nhất: **{", ".join(x.get("symbol") for x in clean)}**')
     lines.append('- Ưu tiên chọn mã có volume tốt, risk về stop thấp và chưa bị extended.')
     lines.append('')
 
@@ -451,7 +595,7 @@ def format_markdown(out):
     if errs:
         lines.append('## ⚠️ Lỗi')
         for e in errs[:10]:
-            lines.append(f'- `{e.get("symbol", "?")}`: {e.get("error", "unknown")}')
+            lines.append(f'- {format_error_message(e)}')
         lines.append('')
 
     # --- Footer ---
@@ -480,6 +624,7 @@ def render_text_report(payload):
             out.append(f'### {symbol}')
             out.append(f'- Nhận định ngắn: {nhan_dinh_ngan(item)}')
             out.append(f'- Hành động: {hanh_dong(item)}')
+            out.append(f'- Độ tự tin execution: {item.get("execution_confidence", "vừa")}')
             out.append(f'- Catalyst/tin tức: {catalyst_text(item)}')
             out.append('- Vùng mua / không mua đuổi / dừng lỗ / chốt lời:')
             out.append(f'  - Vùng mua: {price_band(lv["buy_low"], lv["buy_high"])}')
@@ -537,6 +682,9 @@ def render_text_report(payload):
         lines.append(f"- Mã nên ưu tiên theo dõi lúc này: **{', '.join(uu_tien)}**")
     else:
         lines.append('- Chưa có mã nào đủ đẹp để ưu tiên mạnh tay.')
+    clean = top_clean_setups(payload.get('symbols', []), limit=3)
+    if clean:
+        lines.append(f"- Top setup sạch nhất: **{', '.join(x.get('symbol') for x in clean)}**")
     lines.append('- Nếu thị trường tiếp tục giữ breadth tốt, ưu tiên chọn mã có volume tốt, risk về stop thấp và chưa bị extended.')
     return '\n'.join(lines)
 
@@ -605,15 +753,25 @@ def main():
         news_lines = compact_news_lines(news)
         if item in filtered_watch and not has_usable_news(news):
             continue
+        merged_item = dict(item)
+        merged_item['catalyst_flag'] = news.get('catalyst_flag', 'thieu_catalyst_moi')
+        merged_item['news_score_short_term'] = news.get('news_score_short_term', 0)
+        merged_item['news_score_medium_term'] = news.get('news_score_medium_term', 0)
+        merged_item['setup_rank_score'] = round((merged_item.get('score', 0) + rank_bonus(merged_item)), 2)
         out['symbols'].append({
             'symbol': symbol,
             'tier': 'mua_duoc_ngay' if symbol in out['tiers']['mua_duoc_ngay'] else 'cho_dieu_chinh' if symbol in out['tiers']['cho_dieu_chinh'] else 'chi_quan_sat',
-            'technical': item,
+            'technical': merged_item,
             'news': news,
             'nguon_doc_nhanh': news_lines,
-            'catalyst_flag': news.get('catalyst_flag', 'thieu_catalyst_moi'),
-            'news_score_short_term': news.get('news_score_short_term', 0),
-            'news_score_medium_term': news.get('news_score_medium_term', 0),
+            'catalyst_flag': merged_item.get('catalyst_flag', 'thieu_catalyst_moi'),
+            'news_score_short_term': merged_item.get('news_score_short_term', 0),
+            'news_score_medium_term': merged_item.get('news_score_medium_term', 0),
+            'intraday_freshness': merged_item.get('intraday_freshness', 'fresh'),
+            'setup_quality': merged_item.get('setup_quality', 'trung_binh'),
+            'upgrade_trigger': merged_item.get('upgrade_trigger'),
+            'setup_rank_score': merged_item.get('setup_rank_score', merged_item.get('score', 0)),
+            'execution_confidence': 'cao' if merged_item.get('setup_rank_score', 0) >= 14 else 'vừa' if merged_item.get('setup_rank_score', 0) >= 10 else 'thấp',
         })
 
     if args.as_json:

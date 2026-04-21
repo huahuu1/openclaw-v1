@@ -21,6 +21,15 @@ SHORT_TERM_POSITIVE = ['tăng trần', 'bứt phá', 'đỡ thị trường', 'd
 SHORT_TERM_NEGATIVE = ['bán ròng', 'giảm sàn', 'chốt lời', 'áp lực bán', 'điều chỉnh', 'xả', 'thoát hàng']
 MEDIUM_TERM_POSITIVE = ['cổ tức', 'lợi nhuận', 'kỷ lục', 'tăng trưởng', 'mở rộng', 'thoái vốn', 'mục tiêu', 'kế hoạch', 'hưởng lợi', 'kết quả kinh doanh']
 MEDIUM_TERM_NEGATIVE = ['thua lỗ', 'nợ xấu', 'pha loãng', 'trì hoãn', 'khởi tố', 'thanh tra', 'cảnh báo', 'rủi ro']
+EVENT_DRIVEN_KEYWORDS = [
+    'đhcđ', 'đại hội đồng cổ đông', 'kế hoạch', 'mục tiêu', 'lợi nhuận', 'kết quả kinh doanh',
+    'cổ tức', 'thoái vốn', 'phát hành', 'chia thưởng', 'mua ròng', 'backlog', 'dự án',
+    'ký kết', 'trúng thầu', 'nới room', 'can thiệp sớm', 'tái cơ cấu'
+]
+PRICE_ACTION_ONLY_KEYWORDS = [
+    'tím lịm', 'bốc đầu', 'dậy sóng', 'cú tăng trần', 'lý do cổ phiếu', 'đằng sau cú tăng',
+    'bật tăng kịch trần', 'cổ phiếu', 'phiên sáng', 'chứng khoán hôm nay'
+]
 SOURCE_BONUS = {
     'vnexpress.net': 2,
     'cafef.vn': 2,
@@ -175,8 +184,31 @@ def classify_news_type(title):
     return 'tin tổng hợp'
 
 
+def mentions_symbol(title, symbol):
+    text = (title or '').lower()
+    sym = (symbol or '').lower().strip()
+    if not text or not sym:
+        return False
+    return sym in text or f'({sym})' in text
+
+
+def is_event_driven_headline(title):
+    text = (title or '').lower()
+    return any(x in text for x in EVENT_DRIVEN_KEYWORDS)
+
+
+def is_price_action_only_headline(title):
+    text = (title or '').lower()
+    if not text:
+        return False
+    if is_event_driven_headline(text):
+        return False
+    return any(x in text for x in PRICE_ACTION_ONLY_KEYWORDS)
+
+
 def classify_catalyst_flag(short_items, medium_items):
-    if short_items:
+    strong_short_items = [it for it in short_items if is_event_driven_headline(it.get('title', '')) and not is_price_action_only_headline(it.get('title', ''))]
+    if strong_short_items:
         return 'co_catalyst_moi'
     if medium_items:
         return 'chi_co_tin_trung_han'
@@ -191,7 +223,11 @@ def danh_gia_xu_the_tin(items, total_score):
         it for it in items
         if it.get('freshness') in ('fresh', 'recent', 'aging') and not is_reference_headline(it.get('title', ''))
     ]
-    short_term_items = [it for it in usable_items if (it.get('age_hours') is not None and it.get('age_hours') <= 72)]
+    short_term_items = [
+        it for it in usable_items
+        if (it.get('age_hours') is not None and it.get('age_hours') <= 72)
+        and not is_price_action_only_headline(it.get('title', ''))
+    ]
     medium_term_items = [it for it in usable_items if (it.get('age_hours') is not None and 72 < it.get('age_hours') <= 30 * 24)]
 
     for it in usable_items[:5]:
@@ -315,17 +351,26 @@ def score_symbol_news(symbol, limit=8):
             'freshness': freshness,
             'impact_level': impact_from_score(sc),
             'news_type': classify_news_type(it.get('title', '')),
-            'price_relevance': 'cao' if freshness in ('fresh', 'recent') and abs(sc) >= 3 else 'vừa' if freshness in ('fresh', 'recent', 'aging') and abs(sc) >= 1 else 'thấp',
+            'price_relevance': 'cao' if freshness in ('fresh', 'recent') and abs(sc) >= 3 and is_event_driven_headline(it.get('title', '')) else 'vừa' if freshness in ('fresh', 'recent', 'aging') and abs(sc) >= 1 and not is_price_action_only_headline(it.get('title', '')) else 'thấp',
             'is_reference_like': is_reference_headline(it.get('title', '')),
+            'is_event_driven': is_event_driven_headline(it.get('title', '')),
+            'is_price_action_only': is_price_action_only_headline(it.get('title', '')),
         })
     scored.sort(key=lambda x: (x.get('freshness') == 'fresh', x.get('freshness') == 'recent', x.get('diem_uu_tien_nguon', 0), x.get('score', 0), -(x.get('age_hours') or 9999)), reverse=True)
     usable_for_score = [
         x for x in scored
         if x.get('freshness') in ('fresh', 'recent', 'aging') and not x.get('is_reference_like')
     ]
+    catalyst_usable = [
+        x for x in usable_for_score
+        if not x.get('is_price_action_only') and mentions_symbol(x.get('title', ''), symbol)
+    ]
     display_items = [
         x for x in usable_for_score
         if (x.get('age_hours') is not None and x.get('age_hours') <= 7 * 24)
+        and mentions_symbol(x.get('title', ''), symbol)
+        and x.get('news_type') != 'tin vĩ mô/thị trường'
+        and not x.get('is_price_action_only')
     ]
     total = sum(x.get('score', 0) for x in usable_for_score)
     verdict = 'neutral'
@@ -333,7 +378,7 @@ def score_symbol_news(symbol, limit=8):
         verdict = 'positive'
     elif total <= -5:
         verdict = 'negative'
-    xu_the_tin = danh_gia_xu_the_tin(usable_for_score, total)
+    xu_the_tin = danh_gia_xu_the_tin(catalyst_usable, total)
     return {
         'symbol': symbol,
         'query': query,
@@ -341,6 +386,7 @@ def score_symbol_news(symbol, limit=8):
         'verdict': verdict,
         'items': scored,
         'items_usable': usable_for_score,
+        'items_catalyst_usable': catalyst_usable,
         'news_quality_flag': 'fresh_or_recent' if any(x.get('freshness') in ('fresh', 'recent') for x in usable_for_score) else 'aging_only' if usable_for_score else 'no_usable_news',
         **xu_the_tin,
         'tin_tom_tat': xu_the_tin.get('tin_tom_tat', [])[:3] if display_items else [],
