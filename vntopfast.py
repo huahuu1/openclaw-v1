@@ -370,7 +370,7 @@ def format_error_message(err):
 def has_usable_news(news_payload):
     if not news_payload:
         return False
-    return bool(news_payload.get('tin_tom_tat'))
+    return bool(news_payload.get('tin_tom_tat') or news_payload.get('items_usable') or news_payload.get('items'))
 
 
 def _fmt(x, decimals=2):
@@ -427,6 +427,8 @@ def format_markdown(out):
             lines.append('> 🔥 Có tin mới đáng chú ý cho thị trường')
         elif catalyst_flag == 'chi_co_tin_trung_han':
             lines.append('> 📋 Chủ yếu tin trung hạn / câu chuyện cũ')
+        else:
+            lines.append('> ⚪ News tone có thể tích cực nhẹ, nhưng chưa có catalyst mới đủ mạnh để đẩy kỳ vọng ngắn hạn.')
         lines.append('')
         for it in mn_items[:6]:
             age = it.get('age_hours')
@@ -614,7 +616,10 @@ def render_text_report(payload):
     def section_lines(title, items):
         out = [f'## {title}']
         if not items:
-            out.append('- Chưa có mã phù hợp trong nhóm này.')
+            if title == 'Mua được ngay':
+                out.append('- Hôm nay chưa có setup đủ sạch để mua ngay.')
+            else:
+                out.append('- Chưa có mã phù hợp trong nhóm này.')
             out.append('')
             return out
         for item in items:
@@ -655,7 +660,7 @@ def render_text_report(payload):
     elif market_flag == 'chi_co_tin_trung_han':
         lines.append('  - Trạng thái catalyst thị trường: chủ yếu là tin trung hạn/câu chuyện cũ.')
     else:
-        lines.append('  - Trạng thái catalyst thị trường: chưa có tin mới đủ mạnh.')
+        lines.append('  - Trạng thái catalyst thị trường: news tone có thể tích cực nhẹ, nhưng chưa có catalyst mới đủ mạnh.')
     market_news_lines = []
     for it in (market_news.get('tin_tom_tat') or [])[:3]:
         title = it.get('tieu_de') or it.get('tom_tat') or ''
@@ -751,8 +756,6 @@ def main():
         seen.add(symbol)
         news = news_by_symbol.get(symbol, {})
         news_lines = compact_news_lines(news)
-        if item in filtered_watch and not has_usable_news(news):
-            continue
         merged_item = dict(item)
         merged_item['catalyst_flag'] = news.get('catalyst_flag', 'thieu_catalyst_moi')
         merged_item['news_score_short_term'] = news.get('news_score_short_term', 0)
@@ -771,7 +774,11 @@ def main():
             'setup_quality': merged_item.get('setup_quality', 'trung_binh'),
             'upgrade_trigger': merged_item.get('upgrade_trigger'),
             'setup_rank_score': merged_item.get('setup_rank_score', merged_item.get('score', 0)),
-            'execution_confidence': 'cao' if merged_item.get('setup_rank_score', 0) >= 14 else 'vừa' if merged_item.get('setup_rank_score', 0) >= 10 else 'thấp',
+            'execution_confidence': (
+                'cao' if merged_item.get('setup_rank_score', 0) >= 14 and merged_item.get('intraday_freshness') == 'fresh' and merged_item.get('catalyst_flag') != 'thieu_catalyst_moi'
+                else 'vừa' if merged_item.get('setup_rank_score', 0) >= 10
+                else 'thấp'
+            ),
         })
 
     if args.as_json:
